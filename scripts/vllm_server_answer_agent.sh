@@ -18,6 +18,8 @@ set +a
 ANSWER_AGENT_MODEL="${ANSWER_AGENT_MODEL:-ahmedehabb/Memory-R2-answer-agent}"
 VLLM_TENSOR_PARALLEL=${VLLM_TENSOR_PARALLEL:-1}
 VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-32768}
+# Checkpoint is stored fp32; vLLM 0.8.5 "auto" downcasts that to fp16, but the model was trained in bf16.
+ANSWER_AGENT_DTYPE=${ANSWER_AGENT_DTYPE:-bfloat16}
 
 RENDEZVOUS_DIR=${RENDEZVOUS_DIR:-$REPO/vllm_servers_answer_agent}
 SERVER_IDX=${SERVER_IDX:-0}
@@ -43,6 +45,7 @@ python -m vllm.entrypoints.openai.api_server \
     --port "$VLLM_PORT" \
     --tensor-parallel-size "$VLLM_TENSOR_PARALLEL" \
     --max-model-len "$VLLM_MAX_MODEL_LEN" \
+    --dtype "$ANSWER_AGENT_DTYPE" \
     --gpu-memory-utilization 0.85 \
     --max-num-seqs 512 \
     2>&1 | tee "$LOG_DIR/server_${SERVER_IDX}.log"

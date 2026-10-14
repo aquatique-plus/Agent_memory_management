@@ -7,7 +7,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
-#SBATCH --time=01:00:00
+#SBATCH --time=01:30:00
 #SBATCH --output=/gpfs/radev/home/wf287/scratch/memory_r2/logs/slurm_%x_%j.out
 #
 # LoCoMo test eval (paper setup), all in one 3xH100 job:
@@ -20,8 +20,10 @@
 # Overrides (env, e.g. `sbatch --export=ALL,RUN_TAG=foo scripts/eval_locomo.sbatch`):
 #   MODEL_PATH_OVERRIDE  memory manager (default ahmedehabb/Memory-R2)
 #   ANSWER_AGENT_MODEL   answer agent   (default ahmedehabb/Memory-R2-answer-agent)
+#   ANSWER_AGENT_DTYPE   answer-agent vLLM dtype (default bfloat16)
 #   RUN_TAG              label for logs / dump dir (default memr2_paper)
-#   LLM_JUDGE=1          also score the dump with the LLM judge (needs OPENAI_* judge env)
+#   LLM_JUDGE=1          also score the dump with the LLM judge (LLM_JUDGE_* in src/.env)
+#   LLM_JUDGE_PROVIDER   azure (own key, default) | openai (reuse embedding OPENAI_API_KEY)
 #   ROLLOUT_GPU_MEM_UTIL vLLM rollout gpu_memory_utilization (default 0.7)
 #   EXTRA_HYDRA_OVERRIDES  extra hydra overrides, applied after the memory defaults below
 
@@ -129,7 +131,11 @@ echo "[eval] test eval exited with rc=$EVAL_RC"
 DUMP_ROOT=$REMA_QA_DUMP_DIR/${RUN_TAG}_${RUN_TS}/test/step_unknown
 if [ -d "$DUMP_ROOT" ]; then
     JUDGE_FLAG=""
-    [ "${LLM_JUDGE:-0}" = "1" ] && JUDGE_FLAG="--llm_judge"
+    if [ "${LLM_JUDGE:-0}" = "1" ]; then
+        JUDGE_FLAG="--llm_judge"
+        # Judge key/model come from LLM_JUDGE_* in .env, never from the embedding OPENAI_API_KEY.
+        set -a; source "$REPO/.env" 2>/dev/null || true; set +a
+    fi
     "$CONDA_ENV/bin/python" "$REPO/testing/pipeline_test_locomo_qa_dump/score_locomo_qa_dumps.py" \
         --dump_root "$DUMP_ROOT" \
         --output "$SCRATCH/results/${RUN_TAG}_${RUN_TS}.json" \

@@ -12,10 +12,15 @@ did) — we aggregate overall + per-category means. With --llm_judge (off by
 default) we additionally call the OpenAI-compatible LLM-judge to produce a
 binary CORRECT/WRONG label per QA; without it no API calls are made.
 
-Env (only read with --llm_judge):
-  OPENAI_BASE_URL      (e.g. http://hkn1958.localdomain:8107/v1 for local gpt-oss-120b)
-  OPENAI_API_KEY       (EMPTY for local vLLM; real key for GPT-4o)
-  OPENAI_JUDGE_MODEL   (e.g. gpt-4o or openai/gpt-oss-120b; default gpt-4o-mini)
+Env (only read with --llm_judge). --judge_provider (or LLM_JUDGE_PROVIDER) picks the endpoint:
+  azure  (default) the judge's own key, separate from the text-embedding OPENAI_API_KEY:
+           LLM_JUDGE_API_KEY   (required)
+           LLM_JUDGE_BASE_URL  (required, Azure v1 API: https://<resource>.openai.azure.com/openai/v1/;
+                                any other OpenAI-compatible URL, e.g. a local vLLM, works too)
+           LLM_JUDGE_MODEL     (Azure deployment name)
+  openai   reuse the text-embedding setup: OPENAI_API_KEY (and OPENAI_BASE_URL if set)
+           LLM_JUDGE_MODEL     (default gpt-4o-mini, as in the paper)
+OPENAI_JUDGE_MODEL is never read here: the eval uses it for the answer agent.
 
 Usage:
   # F1/BLEU only (no LLM judge)
@@ -24,9 +29,9 @@ Usage:
     --output results/scored_locomo_<run>_step<step>.json
 
   # With LLM judge
-  OPENAI_BASE_URL=http://hkn1958.localdomain:8107/v1 \
-  OPENAI_API_KEY=EMPTY \
-  OPENAI_JUDGE_MODEL=openai/gpt-oss-120b \
+  LLM_JUDGE_BASE_URL=http://hkn1958.localdomain:8107/v1 \
+  LLM_JUDGE_API_KEY=EMPTY \
+  LLM_JUDGE_MODEL=openai/gpt-oss-120b \
   python testing/pipeline_test_locomo_qa_dump/score_locomo_qa_dumps.py \
     --dump_root qa_dumps/<run_name>/test/step_<step> \
     --output results/scored_locomo_<run>_step<step>_gptoss.json \
@@ -44,9 +49,8 @@ import time
 from collections import defaultdict
 
 
-_BASE_URL = os.getenv("OPENAI_BASE_URL") or None
-_API_KEY = os.getenv("OPENAI_API_KEY", "EMPTY")
-_JUDGE_MODEL = os.getenv("OPENAI_JUDGE_MODEL", "gpt-4o-mini")
+_BASE_URL = None  # resolved in main() from --judge_provider
+_JUDGE_MODEL = os.getenv("LLM_JUDGE_MODEL") or "gpt-4o-mini"  # empty .env entry -> default
 client = None  # created in main() only when --llm_judge is set
 
 
@@ -166,13 +170,28 @@ def main():
     ap.add_argument("--limit", type=int, default=0, help="0 = all")
     ap.add_argument("--llm_judge", action="store_true",
                     help="Also score each QA with the LLM judge (off by default: F1/BLEU only, no API calls).")
+    ap.add_argument("--judge_provider", choices=["azure", "openai"],
+                    default=os.getenv("LLM_JUDGE_PROVIDER", "azure"),
+                    help="azure: LLM_JUDGE_API_KEY + LLM_JUDGE_BASE_URL; openai: reuse the embedding OPENAI_API_KEY.")
     args = ap.parse_args()
 
     if args.llm_judge:
-        global client
+        global client, _BASE_URL
+        if args.judge_provider == "azure":
+            api_key = os.getenv("LLM_JUDGE_API_KEY")
+            _BASE_URL = os.getenv("LLM_JUDGE_BASE_URL") or None
+            if not api_key or not _BASE_URL:
+                sys.exit("[score] --judge_provider azure needs LLM_JUDGE_API_KEY and LLM_JUDGE_BASE_URL "
+                         "(e.g. https://<resource>.openai.azure.com/openai/v1/)")
+        else:
+            api_key = os.getenv("OPENAI_API_KEY")
+            _BASE_URL = os.getenv("OPENAI_BASE_URL") or None
+            if not api_key:
+                sys.exit("[score] --judge_provider openai needs OPENAI_API_KEY (the embedding key)")
         from openai import OpenAI
-        client = OpenAI(api_key=_API_KEY, base_url=_BASE_URL)
-        print(f"[score] judge={_JUDGE_MODEL} base_url={_BASE_URL} dump_root={args.dump_root}")
+        client = OpenAI(api_key=api_key, base_url=_BASE_URL)
+        print(f"[score] judge provider={args.judge_provider} model={_JUDGE_MODEL} "
+              f"base_url={_BASE_URL or 'https://api.openai.com/v1'} dump_root={args.dump_root}")
     else:
         print(f"[score] LLM judge disabled (F1/BLEU only) dump_root={args.dump_root}")
     records = load_dumps(args.dump_root)
@@ -209,6 +228,7 @@ def main():
     summary = {
         "dump_root": args.dump_root,
         "llm_judge": args.llm_judge,
+        "judge_provider": args.judge_provider if args.llm_judge else None,
         "judge_model": _JUDGE_MODEL if args.llm_judge else None,
         "base_url": _BASE_URL if args.llm_judge else None,
         "num_items": len(results),
