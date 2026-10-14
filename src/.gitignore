@@ -1,0 +1,33 @@
+.DS_Store
+__pycache__/
+.env
+.venv
+.idea
+.vscode
+checkpoints/
+outputs/
+wandb/
+data/locomo/processed*
+data/sft/
+data/sft_rlhf/
+data/longmemeval-cleaned/
+*.log
+memory/memory_cache_*
+logs/
+cache/
+qa_dumps*/
+qa_dumps_dedup/
+results/
+
+# Testing pipelines: ignore only the heavy artifacts (vector DBs, big datasets, results, caches)
+testing/results/
+testing/*/qdrants/
+testing/*/dataset/
+testing/*/cache/
+testing/*/__pycache__/
+testing/*/wandb/
+testing/*/.env
+testing/*/.env.local
+
+# Singularity / container images and vLLM server runtime dirs
+*.sif
