@@ -26,6 +26,10 @@ if JUDGE_PROVIDER not in {"gemini", "together", "openai"}:
 GEMINI_JUDGE_MODEL = os.getenv("GEMINI_JUDGE_MODEL", "gemini-2.5-flash-lite")
 TOGETHER_JUDGE_MODEL = os.getenv("TOGETHER_JUDGE_MODEL", "openai/gpt-oss-120b")
 OPENAI_JUDGE_MODEL = os.getenv("OPENAI_JUDGE_MODEL", "gpt-4o-mini")
+# Answer-agent length limits (openai provider). The prompt limit uses vLLM's truncate_prompt_tokens
+# (keeps the last N tokens), so it is only sent to self-hosted vLLM servers, not api.openai.com.
+ANSWER_AGENT_MAX_TOKENS = int(os.getenv("ANSWER_AGENT_MAX_TOKENS", "1024"))
+ANSWER_AGENT_MAX_PROMPT_TOKENS = int(os.getenv("ANSWER_AGENT_MAX_PROMPT_TOKENS", "12288"))
 
 CACHE_DIR = os.getenv("OPENAI_CACHE_DIR", ".")  # Keep same cache dir for compatibility
 MAIN_CACHE_FILE = os.path.join(CACHE_DIR, "judge_cache.json")
@@ -102,11 +106,17 @@ def _call_judge_api(prompt: str, attempt: int = 0) -> str:
 
     if JUDGE_PROVIDER == "openai":
         client_idx = attempt % len(openai_clients)
-        response = openai_clients[client_idx].chat.completions.create(
+        client = openai_clients[client_idx]
+        extra_body = None
+        if "api.openai.com" not in str(client.base_url):
+            extra_body = {"truncate_prompt_tokens": ANSWER_AGENT_MAX_PROMPT_TOKENS}
+        response = client.chat.completions.create(
             model=OPENAI_JUDGE_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
             top_p=1.0,
+            max_tokens=ANSWER_AGENT_MAX_TOKENS,
+            extra_body=extra_body,
         )
         msg = response.choices[0].message
         content = msg.content or getattr(msg, "reasoning", None) or ""

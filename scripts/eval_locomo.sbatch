@@ -21,6 +21,7 @@
 #   MODEL_PATH_OVERRIDE  memory manager (default ahmedehabb/Memory-R2)
 #   ANSWER_AGENT_MODEL   answer agent   (default ahmedehabb/Memory-R2-answer-agent)
 #   ANSWER_AGENT_DTYPE   answer-agent vLLM dtype (default bfloat16)
+#   ANSWER_AGENT_HF_OFFLINE=1  serve the answer agent from the local HF cache only (pre-download it first)
 #   RUN_TAG              label for logs / dump dir (default memr2_paper)
 #   LLM_JUDGE=1          also score the dump with the LLM judge (LLM_JUDGE_* in src/.env)
 #   LLM_JUDGE_PROVIDER   azure (own key, default) | openai (reuse embedding OPENAI_API_KEY)
@@ -52,6 +53,9 @@ export ANSWER_AGENT_MODEL=${ANSWER_AGENT_MODEL:-ahmedehabb/Memory-R2-answer-agen
 export MODEL_PATH_OVERRIDE=${MODEL_PATH_OVERRIDE:-ahmedehabb/Memory-R2}
 export RUN_TAG=${RUN_TAG:-memr2_paper}
 export RUN_TS=$(date +%Y%m%d_%H%M%S)
+# judge_llm.py caches answers by prompt hash only, so keep one cache per answer-agent model;
+# a shared cache would hand one model's answers to another.
+export OPENAI_CACHE_DIR=$SCRATCH/workspace/openai_cache/${ANSWER_AGENT_MODEL//\//__}
 
 # Per-job rendezvous dir + port so stale files / other jobs on the node never get picked up.
 export RENDEZVOUS_DIR=$SCRATCH/rendezvous/answer_agent_$SLURM_JOB_ID
@@ -89,7 +93,7 @@ cp -r "$HOME/.cache/vllm/." "$VLLM_CACHE_ROOT/" 2>/dev/null || true
 # ---------------------------------------------------------------------------
 # 1) Answer agent on GPU 0
 # ---------------------------------------------------------------------------
-CUDA_VISIBLE_DEVICES=$AA_GPU bash "$SCRIPTS/vllm_server_answer_agent.sh" \
+CUDA_VISIBLE_DEVICES=$AA_GPU HF_HUB_OFFLINE=${ANSWER_AGENT_HF_OFFLINE:-0} bash "$SCRIPTS/vllm_server_answer_agent.sh" \
     > "$SCRATCH/logs/answer_agent_$SLURM_JOB_ID.log" 2>&1 &
 AA_PID=$!
 cleanup() {

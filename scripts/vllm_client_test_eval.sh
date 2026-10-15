@@ -60,7 +60,7 @@ export EMBEDDING_CACHE_DIR=$WORKSPACE/embedding_cache
 export MEMORY_CACHE_DIR=$WORKSPACE/memory/memory_cache_${JOB_ID}_${RUN_TAG_SAFE}/train
 export MEMORY_CACHE_DIR_VAL=$WORKSPACE/memory/memory_cache_${JOB_ID}_${RUN_TAG_SAFE}/validation
 export MEMORY_CACHE_DIR_TEST=$WORKSPACE/memory/memory_cache_${JOB_ID}_${RUN_TAG_SAFE}/test
-export OPENAI_CACHE_DIR=$WORKSPACE/openai_cache
+export OPENAI_CACHE_DIR=${OPENAI_CACHE_DIR:-$WORKSPACE/openai_cache}
 export TEACHER_CACHE_DIR=$WORKSPACE/teacher_cache
 
 mkdir -p $LOG_DIR $TMPDIR $RAY_TMPDIR $HYDRA_RUN_DIR $SCRATCH_DIR \
