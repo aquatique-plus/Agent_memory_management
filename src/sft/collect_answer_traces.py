@@ -99,7 +99,7 @@ MEMORY_SYSTEM_PROMPT: str = _prompt_ns["MEMORY_EXECUTOR_PROMPT"]
 # Data preprocessing helpers (reuse from data_preprocess.py)
 # ---------------------------------------------------------------------------
 DATA_PREPROCESS_PATH = PROJECT_ROOT / "data" / "locomo" / "data_preprocess.py"
-_dp_ns: Dict[str, Any] = {}
+_dp_ns: Dict[str, Any] = {"__file__": str(DATA_PREPROCESS_PATH)}
 exec(compile(DATA_PREPROCESS_PATH.read_text(), str(DATA_PREPROCESS_PATH), "exec"), _dp_ns)
 
 flatten_conversation = _dp_ns["flatten_conversation"]
@@ -138,6 +138,26 @@ def compute_f1(prediction: str, truth: str) -> float:
 # API helpers
 # ---------------------------------------------------------------------------
 
+_PROVIDER = "openai"  # set from --provider in main()
+_CLIENT = None
+
+
+def _get_client():
+    """openai: OPENAI_API_KEY. azure: LLM_JUDGE_API_KEY + LLM_JUDGE_AZURE_ENDPOINT (v1 API, no api-version)."""
+    global _CLIENT
+    if _CLIENT is None:
+        import openai
+
+        if _PROVIDER == "azure":
+            _CLIENT = openai.OpenAI(
+                api_key=os.environ["LLM_JUDGE_API_KEY"],
+                base_url=os.environ["LLM_JUDGE_AZURE_ENDPOINT"],
+            )
+        else:
+            _CLIENT = openai.OpenAI()
+    return _CLIENT
+
+
 def _call_openai(
     messages: List[Dict[str, str]],
     model: str,
@@ -147,9 +167,7 @@ def _call_openai(
     backoff: float = 5.0,
 ) -> str:
     """Call OpenAI-compatible chat completion, return assistant text."""
-    import openai
-
-    client = openai.OpenAI()
+    client = _get_client()
     # GPT-5+ / o-series: use max_completion_tokens (not max_tokens), no temperature,
     # and need a much larger budget because reasoning tokens are consumed internally.
     _NEW_PARAM_PREFIXES = ("gpt-5", "o1", "o3", "o4")
@@ -594,6 +612,12 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
+        "--provider",
+        choices=["openai", "azure"],
+        default="openai",
+        help="Chat-completion backend for the fact/memory/QA agents (embeddings always use OPENAI_API_KEY).",
+    )
+    parser.add_argument(
         "--data_path",
         default=str(PROJECT_ROOT / "data" / "locomo" / "locomo10.json"),
         help="Path to locomo10.json",
@@ -680,6 +704,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     random.seed(args.seed)
+    global _PROVIDER
+    _PROVIDER = args.provider
 
     collect_traces(
         data_path=args.data_path,

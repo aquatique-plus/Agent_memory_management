@@ -17,7 +17,9 @@ set +a
 
 ANSWER_AGENT_MODEL="${ANSWER_AGENT_MODEL:-ahmedehabb/Memory-R2-answer-agent}"
 VLLM_TENSOR_PARALLEL=${VLLM_TENSOR_PARALLEL:-1}
-VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-32768}
+# Client (judge_llm.py) caps prompts at ANSWER_AGENT_MAX_PROMPT_TOKENS=12288 and responses at
+# ANSWER_AGENT_MAX_TOKENS=1024, so the context never needs more than 12288 + 1024.
+VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-13312}
 # Checkpoint is stored fp32; vLLM 0.8.5 "auto" downcasts that to fp16, but the model was trained in bf16.
 ANSWER_AGENT_DTYPE=${ANSWER_AGENT_DTYPE:-bfloat16}
 

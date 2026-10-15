@@ -144,4 +144,5 @@ PYTHONUNBUFFERED=1 "${PYTHON_RUNNER[@]}" -m verl.trainer.main_ppo \
   custom_reward_function.name=compute_score \
   algorithm.adv_estimator=grpo \
   algorithm.use_kl_in_reward=False \
-  trainer.logger='["console","wandb"]'
+  trainer.logger='["console","wandb"]' \
+  "$@"
