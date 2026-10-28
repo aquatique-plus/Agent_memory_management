@@ -24,6 +24,7 @@
 #   ANSWER_AGENT_HF_OFFLINE=1  serve the answer agent from the local HF cache only (pre-download it first)
 #   RUN_TAG              label for logs / dump dir (default memr2_paper)
 #   LLM_JUDGE=1          also score the dump with the LLM judge (LLM_JUDGE_* in src/.env)
+#   REMA_DUMP_MEMOPS     log every memory-bank op to qa_dumps/<run>/memory_ops/ (default 1; 0 disables)
 #   LLM_JUDGE_PROVIDER   azure (own key, default) | openai (reuse embedding OPENAI_API_KEY)
 #   ROLLOUT_GPU_MEM_UTIL vLLM rollout gpu_memory_utilization (default 0.7)
 #   EXTRA_HYDRA_OVERRIDES  extra hydra overrides, applied after the memory defaults below
@@ -113,6 +114,7 @@ export N_GPUS=2
 export REMA_DUMP_QA=1
 export VAL_KWARGS_N=${VAL_KWARGS_N:-1}
 export REMA_QA_DUMP_DIR=$SCRATCH/qa_dumps
+export REMA_DUMP_MEMOPS=${REMA_DUMP_MEMOPS:-1}
 
 # Memory: with only 2 GPUs the FSDP actor+ref shards (~30GB reserved/GPU) left vLLM no KV cache
 # at gpu_memory_utilization=0.5 (job 2833514). Test-only never trains, so keep actor/ref on CPU
@@ -146,6 +148,15 @@ if [ -d "$DUMP_ROOT" ]; then
         $JUDGE_FLAG
 else
     echo "[eval] WARNING: no QA dump at $DUMP_ROOT, skipping scoring"
+fi
+
+MEMOPS_DIR=$REMA_QA_DUMP_DIR/${RUN_TAG}_${RUN_TS}/memory_ops
+if [ -d "$MEMOPS_DIR" ]; then
+    echo "[eval] memory-op counts ($MEMOPS_DIR):"
+    cat "$MEMOPS_DIR"/*.jsonl | "$CONDA_ENV/bin/python" -c '
+import sys, json, collections
+c = collections.Counter((d["op"], d["status"]) for d in map(json.loads, sys.stdin))
+for (op, st), n in sorted(c.items()): print(f"  {op:12s} {st:8s} {n}")'
 fi
 
 exit "$EVAL_RC"

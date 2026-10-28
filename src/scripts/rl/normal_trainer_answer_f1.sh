@@ -30,7 +30,7 @@ REF_PARAM_OFFLOAD="${REF_PARAM_OFFLOAD:-False}"
 TOTAL_EPOCHS="${TOTAL_EPOCHS:-5}"
 EXP_NAME="${EXP_NAME:-normal_answer_f1_$(date +%Y%m%d_%H%M%S)}"
 PROJECT_NAME="${PROJECT_NAME:-rema-normal-trainer}"
-CONDA_ENV_NAME="${CONDA_ENV_NAME:-rema}"
+CONDA_ENV_NAME="${CONDA_ENV_NAME-rema}"  # set to "" to skip conda activation
 CONDA_ROOT="${CONDA_ROOT:-<workspace>/miniconda3}"
 
 REWARD_PATH="$REPO_ROOT/sft/rewards/answer_tag_f1_reward.py"

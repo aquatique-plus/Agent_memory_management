@@ -18,6 +18,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import shutil
 from pathlib import Path
 import uuid
 import jsonlines
@@ -1735,11 +1736,29 @@ class RayReMATrainer(object):
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
 
+        # best-on-val tracking, so a resumed run keeps selecting against the same best
+        with open(os.path.join(local_global_step_folder, 'trainer_state.json'), 'w') as f:
+            json.dump({'best_val_acc': self.best_val_acc,
+                       'best_global_step': self.best_global_step,
+                       'patience_counter': self.patience_counter}, f)
+
         # latest checkpointed iteration tracker (for atomic usage)
         local_latest_checkpointed_iteration = os.path.join(self.config.trainer.default_local_dir,
                                                            'latest_checkpointed_iteration.txt')
         with open(local_latest_checkpointed_iteration, 'w') as f:
             f.write(str(self.global_steps))
+
+        # With save_freq below test_freq (checkpoint every step for resume), keep only the checkpoints
+        # that best_checkpoint_info.txt can point to (validated steps) plus the latest one.
+        prev_step = getattr(self, '_last_saved_step', None)
+        test_freq = self.config.trainer.test_freq
+        if self.config.trainer.get('prune_unvalidated_ckpts', False) and prev_step is not None \
+                and prev_step != self.global_steps and test_freq > 0 and prev_step % test_freq != 0 \
+                and prev_step != self.best_global_step:
+            prev_folder = os.path.join(self.config.trainer.default_local_dir, f'global_step_{prev_step}')
+            print(f'Removing unvalidated checkpoint {prev_folder}')
+            shutil.rmtree(prev_folder, ignore_errors=True)
+        self._last_saved_step = self.global_steps
 
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == 'disable':
@@ -1785,14 +1804,23 @@ class RayReMATrainer(object):
             self.critic_wg.load_checkpoint(critic_path,
                                            del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
 
-        # load dataloader,
-        # TODO: from remote not implemented yet
-        dataloader_local_path = os.path.join(global_step_folder, 'data.pt')
-        if os.path.exists(dataloader_local_path):
-            dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
-            self.train_dataloader.load_state_dict(dataloader_state_dict)
+        # The dataloader state (data.pt) is deliberately not restored: fit() updates only at the final
+        # chunk, so every step consumes exactly one full epoch and a checkpoint always sits on an epoch
+        # boundary. Restoring the saved mid-iteration state would make the first resumed epoch yield
+        # nothing and silently drop a step; fit() instead restarts at epoch == global_steps.
+
+        trainer_state_path = os.path.join(global_step_folder, 'trainer_state.json')
+        if os.path.exists(trainer_state_path):
+            with open(trainer_state_path) as f:
+                trainer_state = json.load(f)
+            self.best_val_acc = trainer_state['best_val_acc']
+            self.best_global_step = trainer_state['best_global_step']
+            self.patience_counter = trainer_state['patience_counter']
+            print(f'Restored best val acc {self.best_val_acc} at step {self.best_global_step}, '
+                  f'patience {self.patience_counter}')
         else:
-            print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
+            print(f'Warning: no {trainer_state_path}; best-checkpoint tracking restarts from scratch')
+        self._last_saved_step = self.global_steps
 
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix='global_seqlen'):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
@@ -1837,6 +1865,14 @@ class RayReMATrainer(object):
         # print("\n[FIT] Loading checkpoint...")
         self._load_checkpoint()
         # print(f"[FIT] Checkpoint loaded. Starting from global_steps={self.global_steps}")
+        resumed_steps = self.global_steps
+        max_patience = self.config.trainer.get('early_stop_patience', 3)
+        if resumed_steps and not self.config.trainer.get('test_only', False) and (
+                resumed_steps >= self.total_training_steps or
+                (max_patience > 0 and self.patience_counter >= max_patience)):
+            print(f'[FIT] Checkpoint at step {resumed_steps} already ended training '
+                  f'(total {self.total_training_steps}, patience {self.patience_counter}/{max_patience}); nothing to do.')
+            return
 
         if self.config.trainer.get('fork_wandb_id', None) is not None:
             fork_wandb_id = self.config.trainer.fork_wandb_id
@@ -1868,7 +1904,8 @@ class RayReMATrainer(object):
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
-        if self.val_reward_fn is not None and self.config.trainer.get('val_before_train', True):
+        # (skipped on resume: the step-0 baseline was already logged by the first run)
+        if self.val_reward_fn is not None and self.config.trainer.get('val_before_train', True) and resumed_steps == 0:
             # print("\n[FIT] Running initial validation before training...")
             val_metrics = self._validate()
             pprint(f'Initial validation metrics: {val_metrics}')
@@ -1929,7 +1966,9 @@ class RayReMATrainer(object):
         # print(f"\n[FIT] Starting training loop: {self.config.trainer.total_epochs} epochs, {len(self.train_dataloader)} batches per epoch")
         # print(f"[FIT] Total training steps: {self.total_training_steps}")
 
-        for epoch in range(self.config.trainer.total_epochs):
+        # One step == one epoch (see _load_checkpoint), so a resumed run continues at epoch == resumed_steps;
+        # the epoch also keys the memory snapshots.
+        for epoch in range(resumed_steps, self.config.trainer.total_epochs):
             # print(f"\n{'='*80}")
             # print(f"EPOCH {epoch + 1}/{self.config.trainer.total_epochs}")
             # print(f"{'='*80}")

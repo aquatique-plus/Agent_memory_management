@@ -704,6 +704,90 @@ class MemoryManager:
 
         return operations
 
+def memory_ops_dump_path(split: str) -> Optional[str]:
+    """Per-process memory-op log path, or None when REMA_DUMP_MEMOPS is off.
+
+    Layout: $REMA_QA_DUMP_DIR/$REMA_RUN_NAME/memory_ops/<split>_pid<pid>.jsonl
+    (one file per rollout worker so concurrent workers never interleave lines).
+    Only splits listed in REMA_MEMOPS_SPLITS are logged (default: all splits).
+    """
+    flag = os.environ.get('REMA_DUMP_MEMOPS', '').strip()
+    if flag in ('', '0', 'false', 'False'):
+        return None
+    splits = os.environ.get('REMA_MEMOPS_SPLITS', '').strip()
+    if splits and split not in [s.strip() for s in splits.split(',')]:
+        return None
+    # With tensor parallelism every TP rank executes the same ops; log rank 0 only.
+    try:
+        from vllm.distributed import parallel_state as vllm_ps
+        if vllm_ps.get_tensor_model_parallel_rank() != 0:
+            return None
+    except Exception:
+        pass
+    dump_dir = os.environ.get('REMA_QA_DUMP_DIR', '').strip() or os.path.join(os.getcwd(), 'qa_dumps')
+    run_name = os.environ.get('REMA_RUN_NAME', '').strip() or 'unnamed_run'
+    out_dir = os.path.join(dump_dir, run_name, 'memory_ops')
+    os.makedirs(out_dir, exist_ok=True)
+    return os.path.join(out_dir, f"{split}_pid{os.getpid()}.jsonl")
+
+
+def memory_snapshot_contents(memory: Memory) -> Dict[str, str]:
+    """memory_id -> content, taken before execute_batch so UPDATE/DELETE can log what they replaced."""
+    return {m['memory_id']: m['content'] for m in memory.memories}
+
+
+def dump_memory_ops(
+    path: str,
+    meta: Dict[str, Any],
+    operations: Optional[List[Any]],
+    batch_result: Optional[Dict[str, Any]],
+    before: Optional[Dict[str, str]],
+    memory: Memory,
+    response_text: str = "",
+) -> None:
+    """Append one JSONL record per memory-bank op for a single sample.
+
+    op is one of insert / update / delete / none (empty operations list), or
+    parse_fail when the response had no valid JSON. Failed ops are kept with
+    status="error" and the manager's error message.
+    """
+    base = {
+        **meta,
+        'memory_size_before': len(before) if before is not None else len(memory.memories),
+        'memory_size_after': len(memory.memories),
+    }
+    records = []
+    if operations is None:
+        records.append({**base, 'op': 'parse_fail', 'status': 'error', 'response': response_text})
+    elif not operations:
+        records.append({**base, 'op': 'none', 'status': 'success'})
+    elif 'results' not in batch_result:
+        records.append({**base, 'op': 'batch_error', 'status': 'error',
+                        'error': batch_result.get('message'), 'operations': operations})
+    else:
+        for r in batch_result['results']:
+            cmd = r['command'] if isinstance(r['command'], dict) else {'raw': r['command']}
+            res = r['result']
+            memory_id = res.get('memory_id') or cmd.get('memory_id')
+            records.append({
+                **base,
+                'op_index': r['command_index'],
+                'op': str(cmd.get('operation', '')).lower(),
+                'status': res['status'],
+                'error': res['message'] if res['status'] != 'success' else None,
+                'memory_id': memory_id,
+                'content': cmd.get('content'),
+                'before_content': before.get(memory_id) if isinstance(memory_id, str) else None,
+                'dia_id': cmd.get('dia_id'),
+            })
+    try:
+        with open(path, 'a') as f:
+            for rec in records:
+                f.write(json.dumps(rec, ensure_ascii=False, default=str) + '\n')
+    except Exception as e:
+        print(f"[MemOps] dump failed for {meta}: {e}")
+
+
 def create_function_schema() -> List[Dict[str, Any]]:
     """
     Create OpenAI function calling schema for memory operations.

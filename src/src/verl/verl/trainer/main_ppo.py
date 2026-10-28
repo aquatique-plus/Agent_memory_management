@@ -34,6 +34,9 @@ def get_custom_reward_fn(config):
 
     spec = importlib.util.spec_from_file_location("custom_module", file_path)
     module = importlib.util.module_from_spec(spec)
+    # Register so the function pickles by reference (NaiveRewardManager ships it to a pebble ProcessPool)
+    import sys
+    sys.modules["custom_module"] = module
     try:
         spec.loader.exec_module(module)
     except Exception as e:

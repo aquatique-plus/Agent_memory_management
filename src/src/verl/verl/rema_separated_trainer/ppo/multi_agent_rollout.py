@@ -10,7 +10,9 @@ import torch
 import unicodedata
 import json
 from verl.rema_trainer.memory.memory_core.memory import Memory
-from verl.rema_trainer.memory.memory_core.memory_manager import MemoryManager
+from verl.rema_trainer.memory.memory_core.memory_manager import (
+    MemoryManager, memory_ops_dump_path, memory_snapshot_contents, dump_memory_ops,
+)
 from verl.rema_trainer.memory.memory_core.prompt_generator import format_turns_for_prompt, generate_memory_prompt_using_facts
 from verl.rema_trainer.memory.utils.parse_response import extract_llm_json_from_response
 
@@ -825,6 +827,19 @@ class MultiAgentRollout:
         sample_ids = prompt_data.non_tensor_batch["sample_id"]
         chunk_ids = prompt_data.non_tensor_batch["chunk_id"]
         turns_json = prompt_data.non_tensor_batch["turns_json"]
+        memops_path = memory_ops_dump_path(prompt_data.meta_info.get("split", "unknown"))
+
+        def _memops_meta(idx):
+            meta = {
+                'split': prompt_data.meta_info.get("split", "unknown"),
+                'conv_id': str(sample_ids[idx]),
+                'chunk_id': int(chunk_ids[idx]),
+                'turn': None,
+            }
+            for key in ("epoch", "rollout_idx"):
+                if key in prompt_data.batch.keys():
+                    meta[key] = int(prompt_data.batch[key][idx])
+            return meta
         
         # If unfinished_indices not provided, assume all samples
         if unfinished_indices is None:
@@ -857,6 +872,8 @@ class MultiAgentRollout:
             # If JSON parsing failed, reward is 0
             if not json_parse_success:
                 rewards.append(0.0)
+                if memops_path:
+                    dump_memory_ops(memops_path, _memops_meta(idx), None, None, None, memories[idx], response_text)
                 continue
             
             # Attach turn metadata
@@ -868,8 +885,13 @@ class MultiAgentRollout:
             # Record the parsed operations for downstream evaluation / judging
             memory_operations_per_sample[idx] = operations # list of dicts
 
+            # Pre-op contents so UPDATE/DELETE records show what they replaced
+            before = memory_snapshot_contents(memories[idx]) if memops_path else None
+
             # Execute operations (even if empty list)
             result = shared_manager.execute_batch(memories[idx], operations)
+            if memops_path:
+                dump_memory_ops(memops_path, _memops_meta(idx), operations, result, before, memories[idx])
             
             total_ops = result.get("total_commands", 0)
             successful_ops = result.get("successful", 0)
