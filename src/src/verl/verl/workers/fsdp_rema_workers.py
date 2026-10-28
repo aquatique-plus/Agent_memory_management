@@ -849,6 +849,18 @@ class ActorRolloutRefWorker(Worker):
         if self._is_offload_optimizer:
             offload_fsdp_optimizer(self.actor_optimizer)
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def release_gpu_memory(self):
+        """Drop PyTorch's cached blocks and return this rank's free GPU bytes.
+
+        Used to hand the GPUs to the time-shared answer agent (rema_trainer/answer_agent_timeshare.py);
+        what stays resident is governed by the fsdp_config offload flags and vLLM's sleep mode.
+        """
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        return torch.cuda.mem_get_info()[0]
+
 
 class CriticWorker(Worker):
 

@@ -3,7 +3,7 @@
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 import torch.distributed.tensor
 import torch
-import fire
+import argparse
 from glob import glob
 from collections import defaultdict
 
@@ -44,4 +44,10 @@ def main(fsdp_checkpoint_path, huggingface_model_path, output_path, world_size=4
 
 
 if __name__ == "__main__":
-    fire.Fire(main)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--fsdp_checkpoint_path", required=True)
+    parser.add_argument("--huggingface_model_path", required=True)
+    parser.add_argument("--output_path", required=True)
+    parser.add_argument("--world_size", type=int, default=4)
+    parser.add_argument("--attn_implementation", default="flash_attention_2")
+    main(**vars(parser.parse_args()))
