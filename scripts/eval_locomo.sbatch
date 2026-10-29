@@ -1,18 +1,23 @@
 #!/bin/bash
 #SBATCH --job-name=memr2_eval
-#SBATCH --partition=gpu
-#SBATCH --qos=qos_nmi
-#SBATCH --gres=gpu:h100:3
+#SBATCH --partition=gpu_h200
+#SBATCH --qos=normal
+#SBATCH --gres=gpu:h200:3
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=32
+#SBATCH --cpus-per-task=24
 #SBATCH --mem=400G
-#SBATCH --time=01:30:00
-#SBATCH --output=/gpfs/radev/home/wf287/scratch/memory_r2/logs/slurm_%x_%j.out
+#SBATCH --time=03:00:00
+#SBATCH --output=/nfs/roberts/scratch/pi_qc88/wf287/memory_r2/logs/slurm_%x_%j.out
 #
-# LoCoMo test eval (paper setup), all in one 3xH100 job:
+# LoCoMo test eval (paper setup), all in one 3xH200 job:
 #   GPU 0     -> answer agent  (ahmedehabb/Memory-R2-answer-agent, vLLM server)
 #   GPU 1, 2  -> memory manager (ahmedehabb/Memory-R2, verl test_only run)
+# Settings follow upstream Memory-R2 (memory manager: scripts/vllm_clients/vllm_client_test_eval.sh with
+# verl rollout defaults: bf16, gpu_memory_utilization 0.5, max_response_length 4096, no FSDP offload;
+# answer agent: scripts/vllm_servers/vllm_server_qwen_n11_sft_cont_step50_BV_paper_qadump.sh: vLLM auto dtype,
+# gpu_memory_utilization 0.40, no max_tokens / prompt truncation). Only difference: upstream gives the
+# memory manager 4 GPUs, here it gets 2.
 # Then scores the QA dump with F1/BLEU only (no LLM judge).
 #
 # Submit:
@@ -20,27 +25,31 @@
 # Overrides (env, e.g. `sbatch --export=ALL,RUN_TAG=foo scripts/eval_locomo.sbatch`):
 #   MODEL_PATH_OVERRIDE  memory manager (default ahmedehabb/Memory-R2)
 #   ANSWER_AGENT_MODEL   answer agent   (default ahmedehabb/Memory-R2-answer-agent)
-#   ANSWER_AGENT_DTYPE   answer-agent vLLM dtype (default bfloat16)
+#   ANSWER_AGENT_DTYPE   answer-agent vLLM dtype (default auto, as upstream)
+#   MODEL_DTYPE          memory-manager vLLM rollout dtype (default: verl's bfloat16, as upstream)
+#   MAX_OUTPUT_TOKENS    cap generated tokens per call for both models (default: upstream, i.e. memory
+#                        manager 4096 and no answer-agent cap)
 #   ANSWER_AGENT_HF_OFFLINE=1  serve the answer agent from the local HF cache only (pre-download it first)
 #   RUN_TAG              label for logs / dump dir (default memr2_paper)
 #   LLM_JUDGE=1          also score the dump with the LLM judge (LLM_JUDGE_* in src/.env)
 #   LLM_JUDGE_PROVIDER   azure (own key, default) | openai (reuse embedding OPENAI_API_KEY)
-#   ROLLOUT_GPU_MEM_UTIL vLLM rollout gpu_memory_utilization (default 0.7)
+#   ROLLOUT_GPU_MEM_UTIL vLLM rollout gpu_memory_utilization (default 0.5, upstream)
+#   MM_PARAM_OFFLOAD=1   keep the FSDP actor/ref on CPU (frees ~25GB/GPU for KV cache if 0.5 OOMs)
 #   EXTRA_HYDRA_OVERRIDES  extra hydra overrides, applied after the memory defaults below
 
 set -uo pipefail
 
-SCRIPTS=/gpfs/radev/project/q_chen/wf287/memory_r2/scripts
-REPO=/gpfs/radev/project/q_chen/wf287/memory_r2/src
-SCRATCH=/gpfs/radev/home/wf287/scratch/memory_r2
-GPFS_CONDA_ENV=/gpfs/radev/home/wf287/project/conda_envs/memory_r2
-ENV_PACK=$SCRATCH/envpack/memory_r2.tar.zst   # tar of $GPFS_CONDA_ENV; rebuild after changing the env
+SCRIPTS=/nfs/roberts/project/pi_qc88/wf287/memory_r2/scripts
+REPO=/nfs/roberts/project/pi_qc88/wf287/memory_r2/src
+SCRATCH=/nfs/roberts/scratch/pi_qc88/wf287/memory_r2
+SHARED_CONDA_ENV=/nfs/roberts/project/pi_qc88/wf287/conda-envs/memory_r2
+ENV_PACK=$SCRATCH/envpack/memory_r2.tar.zst   # tar of $SHARED_CONDA_ENV; rebuild after changing the env
 mkdir -p "$SCRATCH/logs"
 
 # ---------------------------------------------------------------------------
 # Split the 3 allocated GPUs: first -> answer agent, other two -> memory manager
 # ---------------------------------------------------------------------------
-IFS=',' read -ra GPUS <<< "${CUDA_VISIBLE_DEVICES:?CUDA_VISIBLE_DEVICES not set (run under sbatch with --gres=gpu:h100:3)}"
+IFS=',' read -ra GPUS <<< "${CUDA_VISIBLE_DEVICES:?CUDA_VISIBLE_DEVICES not set (run under sbatch with --gres=gpu:h200:3)}"
 if [ "${#GPUS[@]}" -ne 3 ]; then
     echo "[eval] ERROR: expected 3 GPUs, got CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
     exit 1
@@ -80,8 +89,8 @@ if [ -f "$ENV_PACK" ]; then
     export CONDA_ENV=$NODE_LOCAL_DIR/memory_r2
     echo "[eval] unpacked conda env to $CONDA_ENV in $(( $(date +%s) - t0 ))s"
 else
-    export CONDA_ENV=$GPFS_CONDA_ENV
-    echo "[eval] WARNING: $ENV_PACK missing, importing from GPFS env $CONDA_ENV"
+    export CONDA_ENV=$SHARED_CONDA_ENV
+    echo "[eval] WARNING: $ENV_PACK missing, importing from shared env $CONDA_ENV"
 fi
 export VLLM_CACHE_ROOT=$NODE_LOCAL_DIR/vllm_cache
 export TORCHINDUCTOR_CACHE_DIR=$NODE_LOCAL_DIR/inductor_cache
@@ -114,14 +123,28 @@ export REMA_DUMP_QA=1
 export VAL_KWARGS_N=${VAL_KWARGS_N:-1}
 export REMA_QA_DUMP_DIR=$SCRATCH/qa_dumps
 
-# Memory: with only 2 GPUs the FSDP actor+ref shards (~30GB reserved/GPU) left vLLM no KV cache
-# at gpu_memory_utilization=0.5 (job 2833514). Test-only never trains, so keep actor/ref on CPU
-# (they're only moved to GPU briefly to sync weights into vLLM, which starts with dummy weights)
-# and give vLLM more of the card. Don't go much above 0.7: the sync needs headroom for the actor shard.
-MEM_OVERRIDES="actor_rollout_ref.actor.fsdp_config.param_offload=True \
+# Output length: upstream defaults unless MAX_OUTPUT_TOKENS is set (then it caps both models).
+if [ -n "${MAX_OUTPUT_TOKENS:-}" ]; then
+    export MAX_RESPONSE_LENGTH_OVERRIDE=$MAX_OUTPUT_TOKENS
+    export ANSWER_AGENT_MAX_TOKENS=$MAX_OUTPUT_TOKENS
+else
+    export ANSWER_AGENT_MAX_TOKENS=0   # 0 = no max_tokens, as upstream
+fi
+export ANSWER_AGENT_MAX_PROMPT_TOKENS=${ANSWER_AGENT_MAX_PROMPT_TOKENS:-0}   # 0 = no prompt truncation, as upstream
+
+# Memory: upstream settings (rollout gpu_memory_utilization=0.5, actor/ref resident on GPU).
+# On 80GB H100s the FSDP actor+ref shards (~30GB reserved/GPU) left vLLM no KV cache at 0.5
+# (job 2833514); a 141GB H200 leaves ~25GB/GPU of KV cache. If it still OOMs, MM_PARAM_OFFLOAD=1
+# keeps actor/ref on CPU (test-only never trains; they're only moved to GPU to sync weights into vLLM).
+MEM_OVERRIDES="actor_rollout_ref.rollout.gpu_memory_utilization=${ROLLOUT_GPU_MEM_UTIL:-0.5}"
+if [ -n "${MODEL_DTYPE:-}" ]; then
+    MEM_OVERRIDES="$MEM_OVERRIDES actor_rollout_ref.rollout.dtype=$MODEL_DTYPE"
+fi
+if [ "${MM_PARAM_OFFLOAD:-0}" = "1" ]; then
+    MEM_OVERRIDES="$MEM_OVERRIDES actor_rollout_ref.actor.fsdp_config.param_offload=True \
 actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
-actor_rollout_ref.ref.fsdp_config.param_offload=True \
-actor_rollout_ref.rollout.gpu_memory_utilization=${ROLLOUT_GPU_MEM_UTIL:-0.7}"
+actor_rollout_ref.ref.fsdp_config.param_offload=True"
+fi
 export EXTRA_HYDRA_OVERRIDES="$MEM_OVERRIDES ${EXTRA_HYDRA_OVERRIDES:-}"
 echo "[eval] EXTRA_HYDRA_OVERRIDES=$EXTRA_HYDRA_OVERRIDES"
 

@@ -28,6 +28,7 @@ TOGETHER_JUDGE_MODEL = os.getenv("TOGETHER_JUDGE_MODEL", "openai/gpt-oss-120b")
 OPENAI_JUDGE_MODEL = os.getenv("OPENAI_JUDGE_MODEL", "gpt-4o-mini")
 # Answer-agent length limits (openai provider). The prompt limit uses vLLM's truncate_prompt_tokens
 # (keeps the last N tokens), so it is only sent to self-hosted vLLM servers, not api.openai.com.
+# 0 disables a limit (upstream Memory-R2 sends neither).
 ANSWER_AGENT_MAX_TOKENS = int(os.getenv("ANSWER_AGENT_MAX_TOKENS", "1024"))
 ANSWER_AGENT_MAX_PROMPT_TOKENS = int(os.getenv("ANSWER_AGENT_MAX_PROMPT_TOKENS", "12288"))
 
@@ -107,16 +108,17 @@ def _call_judge_api(prompt: str, attempt: int = 0) -> str:
     if JUDGE_PROVIDER == "openai":
         client_idx = attempt % len(openai_clients)
         client = openai_clients[client_idx]
-        extra_body = None
-        if "api.openai.com" not in str(client.base_url):
-            extra_body = {"truncate_prompt_tokens": ANSWER_AGENT_MAX_PROMPT_TOKENS}
+        limits = {}
+        if ANSWER_AGENT_MAX_TOKENS > 0:
+            limits["max_tokens"] = ANSWER_AGENT_MAX_TOKENS
+        if ANSWER_AGENT_MAX_PROMPT_TOKENS > 0 and "api.openai.com" not in str(client.base_url):
+            limits["extra_body"] = {"truncate_prompt_tokens": ANSWER_AGENT_MAX_PROMPT_TOKENS}
         response = client.chat.completions.create(
             model=OPENAI_JUDGE_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
             top_p=1.0,
-            max_tokens=ANSWER_AGENT_MAX_TOKENS,
-            extra_body=extra_body,
+            **limits,
         )
         msg = response.choices[0].message
         content = msg.content or getattr(msg, "reasoning", None) or ""

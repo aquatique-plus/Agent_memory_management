@@ -2,7 +2,7 @@
 # Test set evaluation script — runs test_only on the 7 held-out conversations.
 # Evaluates a trained (or untrained) model without any training updates.
 #
-# Normally launched by scripts/eval_locomo.sbatch (answer agent + this client in one 3xH100 job).
+# Normally launched by scripts/eval_locomo.sbatch (answer agent + this client in one 3xH200 job).
 # Manual use (paper setup: Memory-R2 memory manager + Memory-R2 answer agent):
 #   1) start the answer agent: bash scripts/vllm_server_answer_agent.sh
 #   2) export MODEL_PATH_OVERRIDE="ahmedehabb/Memory-R2"
@@ -27,9 +27,9 @@
 
 export SKIP_NODE_CHECK=1
 
-REPO=/gpfs/radev/project/q_chen/wf287/memory_r2/src
-WORKSPACE=/gpfs/radev/home/wf287/scratch/memory_r2/workspace
-CONDA_ENV=${CONDA_ENV:-/gpfs/radev/home/wf287/project/conda_envs/memory_r2}  # eval_locomo.sbatch points this at a node-local copy
+REPO=/nfs/roberts/project/pi_qc88/wf287/memory_r2/src
+WORKSPACE=/nfs/roberts/scratch/pi_qc88/wf287/memory_r2/workspace
+CONDA_ENV=${CONDA_ENV:-/nfs/roberts/project/pi_qc88/wf287/conda-envs/memory_r2}  # eval_locomo.sbatch points this at a node-local copy
 
 # Source repo .env so HF_TOKEN / OPENAI_API_KEY survive across srun (srun doesn't propagate non-exported user env)
 set -a
@@ -47,12 +47,12 @@ export JOB_ID=${SLURM_JOB_ID:-local_$(date +%Y%m%d_%H%M%S)}
 export RUN_TAG=${RUN_TAG:-test_eval_${JOB_ID}}
 export RUN_TS=${RUN_TS:-$(date +%Y%m%d_%H%M%S)}
 RUN_TAG_SAFE=$(echo "${RUN_TAG}" | tr -cs '[:alnum:]_-' '_')
-export LOG_DIR=/gpfs/radev/home/wf287/scratch/memory_r2/logs/$JOB_ID
+export LOG_DIR=/nfs/roberts/scratch/pi_qc88/wf287/memory_r2/logs/$JOB_ID
 export TMPDIR=${NODE_LOCAL_DIR:-$WORKSPACE}/tmp  # NODE_LOCAL_DIR keeps small-file churn off GPFS
 export RAY_TMPDIR=/tmp/$USER/ray_$JOB_ID
 export HYDRA_RUN_DIR=$WORKSPACE/hydra_${RUN_TAG_SAFE}_$JOB_ID
 export SCRATCH_DIR=$WORKSPACE/verl_$JOB_ID
-export HF_HOME=/gpfs/radev/home/wf287/scratch/hf_cache
+export HF_HOME=/nfs/roberts/scratch/pi_qc88/wf287/hf_cache
 export HF_DATASETS_CACHE=$WORKSPACE/hf_datasets
 export TRITON_HOME=${NODE_LOCAL_DIR:-$WORKSPACE}/trition
 export TRITON_DUMP_DIR=${NODE_LOCAL_DIR:-$WORKSPACE}/trition_dump
@@ -144,7 +144,7 @@ echo "[test-eval] Model: $MODEL_PATH"
 echo "[test-eval] RUN_TAG: $RUN_TAG"
 
 # Use pre-processed data (max_sessions=32, all 7 test convs)
-DATASET_DIR=/gpfs/radev/home/wf287/scratch/memory_r2/data/locomo/processed
+DATASET_DIR=/nfs/roberts/scratch/pi_qc88/wf287/memory_r2/data/locomo/processed
 NUM_TEST_CONVS=7    # 7 held-out test convs (conv-41,49,50,42,48,30,26); conv-47 reserved for train
 NUM_VAL_CONVS=1
 NUM_TRAIN_CONVS=4   # train_batch_size * rollout.n must be divisible by N_GPUS (trainer validation requirement)
@@ -181,7 +181,7 @@ export REMA_REWARD_QA_TOP_K_PER_SPEAKER=${QA_TOP_K_OVERRIDE:-30}
 # Only emits for splits listed in REMA_QA_DUMP_SPLITS (default test,val).
 if [ -n "${REMA_DUMP_QA:-}" ]; then
   export REMA_DUMP_QA
-  export REMA_QA_DUMP_DIR=${REMA_QA_DUMP_DIR:-/gpfs/radev/home/wf287/scratch/memory_r2/qa_dumps}
+  export REMA_QA_DUMP_DIR=${REMA_QA_DUMP_DIR:-/nfs/roberts/scratch/pi_qc88/wf287/memory_r2/qa_dumps}
   export REMA_QA_DUMP_SPLITS=${REMA_QA_DUMP_SPLITS:-test,val}
   export REMA_RUN_NAME=${REMA_RUN_NAME:-${RUN_TAG}_${RUN_TS}}
   echo "[test-eval] QA-dump enabled: dir=$REMA_QA_DUMP_DIR splits=$REMA_QA_DUMP_SPLITS run=$REMA_RUN_NAME"
@@ -300,7 +300,7 @@ test_mhop=$(grep -oE 'test/multi_hop_f1:[0-9.eE+-]+' "$LOG_FILE" | tail -n 1 | c
 echo "[test-eval] END_TS=$RUN_END_ISO RC=$RUN_RC WALL_SEC=$RUN_WALL_SEC" | tee -a "$LOG_FILE"
 echo "[test-eval] LATENCY_SUMMARY run_tag=$RUN_TAG model=$MODEL_PATH wall_sec=$RUN_WALL_SEC test_timing_s_total=${test_timing_s_total:-NA} test_timing_s_gen=${test_timing_s_gen:-NA} test_timing_per_token_ms_gen=${test_timing_per_token_ms_gen:-NA} test_sec_per_conv=${test_sec_per_conv:-NA} test_total_completion_tokens=${test_total_completion_tokens:-NA} test_acc=${test_acc:-NA} test_bleu=${test_bleu:-NA} test_mhop_f1=${test_mhop:-NA}" | tee -a "$LOG_FILE"
 
-LAT_TSV="/gpfs/radev/home/wf287/scratch/memory_r2/logs/latency_summary.tsv"
+LAT_TSV="/nfs/roberts/scratch/pi_qc88/wf287/memory_r2/logs/latency_summary.tsv"
 if [ ! -f "$LAT_TSV" ]; then
     echo -e "date\trun_tag\tjob_id\tmodel_path\tmax_num_turns\twall_sec\ttest_timing_s_total\ttest_timing_s_gen\ttest_timing_s_reward\ttest_timing_per_token_ms_gen\ttest_timing_per_token_ms_total\ttest_sec_per_conv\ttest_gen_sec_per_conv\ttest_total_completion_tokens\ttest_num_finished\ttiming_s_gen_fit\ttiming_s_testing_fit\tthroughput_fit\ttest_acc\ttest_bleu\ttest_mhop_f1\tlog_file\trc" > "$LAT_TSV"
 fi
