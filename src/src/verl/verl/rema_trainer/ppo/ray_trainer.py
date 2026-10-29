@@ -351,7 +351,8 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         step_mask = data.batch['step_ids'] != -100
         advantages, returns = core_algos.compute_grpo_outcome_advantage(token_level_rewards=grpo_sparse_rewards,
                                                                         eos_mask=step_mask,
-                                                                        index=index)
+                                                                        index=index,
+                                                                        norm_adv_by_std=data.meta_info.get('norm_adv_by_std', True))
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
     elif adv_estimator == AdvantageEstimator.GRPO_MAXRL:
@@ -505,6 +506,75 @@ def merge_roles_data(data: DataProto) -> DataProto:
     
     merged_data = DataProto.from_dict(new_tensor_batch, non_tensors=new_non_tensor_batch, meta_info=data.meta_info)
     return merged_data
+
+_BYTE_DECODER = None
+
+
+def _token_bytes(tokenizer, token_ids):
+    """UTF-8 bytes of each token of a byte-level BPE tokenizer (Qwen2)."""
+    global _BYTE_DECODER
+    if _BYTE_DECODER is None:
+        from transformers.models.gpt2.tokenization_gpt2 import bytes_to_unicode
+        _BYTE_DECODER = {c: b for b, c in bytes_to_unicode().items()}
+    pieces = []
+    for tok in tokenizer.convert_ids_to_tokens(token_ids):
+        if tok is None:
+            pieces.append(b'')
+        elif all(c in _BYTE_DECODER for c in tok):
+            pieces.append(bytes(_BYTE_DECODER[c] for c in tok))
+        else:  # special token
+            pieces.append(tok.encode('utf-8'))
+    return pieces
+
+
+def _fact_object_spans(text):
+    """(start, end, fact) character spans of the {..., "fact": ...} objects in a fact-extractor output."""
+    decoder = json.JSONDecoder()
+    spans = []
+    i = text.find('{')
+    while i != -1:
+        try:
+            obj, end = decoder.raw_decode(text, i)
+        except ValueError:
+            obj, end = None, i + 1
+        if isinstance(obj, dict) and isinstance(obj.get('fact'), str) and obj.get('fact'):
+            spans.append((i, end, obj['fact']))
+            i = text.find('{', end)
+        else:
+            i = text.find('{', i + 1)
+    return spans
+
+
+def compute_unretrieved_fact_token_weights(batch: DataProto, retrieved_per_row, tokenizer, weight: float) -> torch.Tensor:
+    """Token weights for the fact-extractor (meta_thinking) rows in insert-only mode: tokens of a fact whose
+    memory entry was not retrieved by any QA behind the row's reward get `weight`, all others 1.
+
+    In insert-only mode each memory entry's content is the fact text, so a fact counts as retrieved when its
+    text is in that row's set of retrieved memory contents. Weights are aligned with `labels`/`step_ids`.
+    """
+    labels = batch.batch['meta_thinking_labels']
+    step_ids = batch.batch['meta_thinking_step_ids']
+    weights = torch.ones_like(labels, dtype=torch.float32)
+    for row, retrieved in enumerate(retrieved_per_row):
+        row_steps = step_ids[row]
+        for turn in torch.unique(row_steps[row_steps != -100]).tolist():
+            positions = (row_steps == turn).nonzero(as_tuple=True)[0]
+            pieces = _token_bytes(tokenizer, labels[row, positions].tolist())
+            starts, offset = [], 0
+            for piece in pieces:
+                starts.append(offset)
+                offset += len(piece)
+            text = b''.join(pieces).decode('utf-8', errors='replace')
+            for start, end, fact in _fact_object_spans(text):
+                if fact in retrieved:
+                    continue
+                byte_start = len(text[:start].encode('utf-8'))
+                byte_end = len(text[:end].encode('utf-8'))
+                for k, piece in enumerate(pieces):
+                    if starts[k] < byte_end and starts[k] + len(piece) > byte_start:
+                        weights[row, positions[k]] = weight
+    return weights
+
 
 @contextmanager
 def _timer(name: str, timing_raw: Dict[str, float]):
@@ -1707,6 +1777,12 @@ class RayReMATrainer(object):
         self.actor_rollout_wg = all_wg['actor_rollout']
         self.actor_rollout_wg.init_model()
 
+    def _set_fact_token_weights(self, batch: DataProto, retrieved_per_row, weight: float):
+        batch.batch['meta_thinking_token_weights'] = compute_unretrieved_fact_token_weights(
+            batch, retrieved_per_row, self.tokenizer, weight)
+        # merge_roles_data pairs role-prefixed keys, so the executor rows need the key too.
+        batch.batch['reasoning_token_weights'] = torch.ones_like(batch.batch['reasoning_labels'], dtype=torch.float32)
+
     def _save_checkpoint(self):
         # path: given_path + `/global_step_{global_steps}` + `/actor`
         local_global_step_folder = os.path.join(self.config.trainer.default_local_dir,
@@ -1855,6 +1931,13 @@ class RayReMATrainer(object):
         # print("="*80)
 
         self.global_steps = 0
+
+        # Insert-only only: weight for the tokens of facts that no QA behind their reward retrieved.
+        unretrieved_fact_weight = self.config.actor_rollout_ref.actor.get('unretrieved_fact_weight', None)
+        if unretrieved_fact_weight is not None:
+            assert self.config.actor_rollout_ref.rollout.get('insert_only', False), (
+                "unretrieved_fact_weight needs rollout.insert_only: memory entries must be the facts themselves")
+            unretrieved_fact_weight = float(unretrieved_fact_weight)
         
         # Best validation tracking
         self.best_val_acc = -1.0
@@ -2361,6 +2444,12 @@ class RayReMATrainer(object):
                                 propagated_reward, turn_mask, self.config.algorithm.gamma_turn_level)
 
                         # Keep TensorDict schema aligned with normal batches before final concat.
+                        if unretrieved_fact_weight is not None:
+                            # An inner row's reward uses all of its sampled QAs.
+                            self._set_fact_token_weights(
+                                inner_eval_batch,
+                                [retrieved_all for _, retrieved_all in getattr(self.reward_fn, '__wrapped__', self.reward_fn).last_retrieved_contents],
+                                unretrieved_fact_weight)
                         if 'source_rollout_idx' in inner_eval_batch.batch.keys():
                             inner_eval_batch.batch.pop('source_rollout_idx')
 
@@ -2416,6 +2505,22 @@ class RayReMATrainer(object):
                         terminal_batch.meta_info['memory_snapshot_suffix'] = ''
                         
                         reward_tensor_map = self.reward_fn(terminal_batch, compression_penalty=self.config.trainer.compression_penalty)
+                        if unretrieved_fact_weight is not None:
+                            # A session-s row is rewarded with per_session_f1[s] of its (sample, rollout) terminal row,
+                            # so its facts count as retrieved if a QA behind that session's F1 retrieved them.
+                            retrieved_by_key = {
+                                key: by_session
+                                for key, (by_session, _) in zip(terminal_keys_ordered, getattr(self.reward_fn, '__wrapped__', self.reward_fn).last_retrieved_contents)
+                            }
+                            for b in all_batches:
+                                rollout_idxs = b.batch['rollout_idx']
+                                rollout_idxs = rollout_idxs.cpu().tolist() if isinstance(rollout_idxs, torch.Tensor) else list(rollout_idxs)
+                                retrieved_per_row = [
+                                    retrieved_by_key[(sample_id, int(rollout_idx))].get(int(chunk_id), set())
+                                    for sample_id, rollout_idx, chunk_id in zip(
+                                        b.non_tensor_batch['sample_id'], rollout_idxs, b.non_tensor_batch['chunk_id'])
+                                ]
+                                self._set_fact_token_weights(b, retrieved_per_row, unretrieved_fact_weight)
                         # print(f"[STEP {self.global_steps}] Reward computed. Keys: {list(reward_tensor_map.keys())}")
                         
                         # Process metrics (logging only)
@@ -2669,11 +2774,19 @@ class RayReMATrainer(object):
                         # Concatenate everything for PPO update
                         # print(f"[STEP {self.global_steps}] Concatenating {len(all_batches)} batches for update...")
                         batch = DataProto.concat(all_batches + evaluated_inner_batches)
+                        if unretrieved_fact_weight is not None:
+                            fact_weights = batch.batch['meta_thinking_token_weights']
+                            fact_mask = batch.batch['meta_thinking_step_ids'] != -100
+                            metrics['train/unretrieved_fact_token_frac'] = (
+                                ((fact_weights < 1) & fact_mask).sum() / fact_mask.sum().clamp(min=1)).item()
                         
                         # Fix for DP chunking error: Ensure the final batch size (after role expansion) is perfectly 
                         # divisible by world_size by dropping dangling inner samples at the very end of the batch.
+                        # insert_only keeps only the fact-extractor rows (see merge below), so one row per sample.
+                        insert_only = self.config.actor_rollout_ref.rollout.get('insert_only', False)
+                        trained_roles = 1 if insert_only else len(agent_roles)
                         target_bsz_before_roles = len(batch.batch)
-                        while (target_bsz_before_roles * len(agent_roles)) % self.actor_rollout_wg.world_size != 0:
+                        while (target_bsz_before_roles * trained_roles) % self.actor_rollout_wg.world_size != 0:
                             target_bsz_before_roles -= 1
                             
                         if target_bsz_before_roles < len(batch.batch):
@@ -2691,6 +2804,12 @@ class RayReMATrainer(object):
                         # print(f"\n[STEP {self.global_steps}] Computing advantages (Trajectory Aggregated)...")
                         # Merge different role data into a single DataProto
                         merged_batch = merge_roles_data(batch)
+                        if self.config.actor_rollout_ref.rollout.get('insert_only', False):
+                            # Executor rows (second half, agent_roles[1]) are rule-based INSERTs: no gradient.
+                            import copy
+                            meta_info = copy.deepcopy(merged_batch.meta_info)
+                            merged_batch = merged_batch[:len(batch.batch)]
+                            merged_batch.meta_info = meta_info
 
                         # Recalculate global_token_num for the entire merged mega-batch
                         # This ensures the metadata has the correct length (2 * MegaBatchSize) 
@@ -2749,6 +2868,7 @@ class RayReMATrainer(object):
                         # print(f"[STEP {self.global_steps}] Computing advantages with {self.config.algorithm.adv_estimator}...")
                         batch.meta_info['gamma_turn_level'] = self.config.algorithm.gamma_turn_level
                         batch.meta_info['use_bilevel_gae'] = self.config.algorithm.get('use_bilevel_gae', False)
+                        batch.meta_info['norm_adv_by_std'] = self.config.algorithm.get('norm_adv_by_std_in_grpo', True)
                         batch = compute_advantage(batch,
                                                   adv_estimator=self.config.algorithm.adv_estimator,
                                                   gamma=self.config.algorithm.gamma_token_level,

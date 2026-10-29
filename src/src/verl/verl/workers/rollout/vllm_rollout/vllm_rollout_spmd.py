@@ -1118,8 +1118,14 @@ class vLLMRollout(BaseRollout):
 
                 # Generate responses for current role
                 # print(f"  Generating responses...")
-                current_outputs, num_gen_tokens, stop_reasons, resp_lens, prompt_lens = self._generate_role_responses(
-                    prompt_proto, tokenizer, response_length, **kwargs)
+                self._use_role_weights(role)
+                if role == agent_roles[1] and self.config.get('insert_only', False):
+                    # Insert-only ablation: the executor is not run; every extracted fact becomes an INSERT.
+                    current_outputs, num_gen_tokens, stop_reasons, resp_lens, prompt_lens = self._insert_all_facts_responses(
+                        [history[idx][-1]['content'] for idx in unfinished_indices], prompt_proto, tokenizer)
+                else:
+                    current_outputs, num_gen_tokens, stop_reasons, resp_lens, prompt_lens = self._generate_role_responses(
+                        prompt_proto, tokenizer, response_length, **kwargs)
                 if not (
                     len(current_outputs) == len(unfinished_indices)
                     and len(num_gen_tokens) == len(unfinished_indices)
@@ -1602,6 +1608,44 @@ class vLLMRollout(BaseRollout):
 
         # return output_text_clean, num_gen_tokens, stop_reasons, resp_lens
         return vllm_output_text, num_gen_tokens, stop_reasons, resp_lens, prompt_lens
+
+    def set_role_weights(self, role_weights, default_weights):
+        """Generate each role in role_weights with its own state dict (HF names), and every other
+        role with default_weights, which must be what vLLM currently holds. Pass None to stop."""
+        self._role_weights = role_weights
+        self._default_weights = default_weights
+        self._loaded_weights = default_weights
+
+    def _use_role_weights(self, role):
+        if getattr(self, '_role_weights', None) is None:
+            return
+        weights = self._role_weights.get(role, self._default_weights)
+        if weights is self._loaded_weights:
+            return
+        model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
+        model.load_weights(weights.items())
+        # Cached prefixes were computed with the other weights.
+        self.inference_engine.reset_prefix_cache()
+        self._loaded_weights = weights
+
+    def _insert_all_facts_responses(self, facts_responses: List[str], prompt_proto: DataProto, tokenizer):
+        """Executor outputs for insert_only mode: one INSERT per extracted fact, in the same
+        return format as _generate_role_responses."""
+        outputs = []
+        for facts_response in facts_responses:
+            facts_data = extract_llm_json_from_response(facts_response)
+            facts = facts_data.get("facts", []) if facts_data.get("_parse_success", False) else []
+            operations = [
+                {"operation": "INSERT", "speaker": fact.get("speaker"), "content": fact.get("fact", ""),
+                 "dia_id": fact.get("dia_id")}
+                for fact in facts
+                if isinstance(fact, dict) and fact.get("fact")
+            ]
+            outputs.append(json.dumps({"operations": operations}, ensure_ascii=False))
+        num_gen_tokens = [len(tokenizer.encode(o, add_special_tokens=False)) for o in outputs]
+        stop_reasons = ["stop"] * len(outputs)
+        prompt_lens = prompt_proto.batch['attention_mask'].sum(dim=1).tolist()
+        return outputs, num_gen_tokens, stop_reasons, num_gen_tokens, prompt_lens
 
     def _update_history_and_check_finish(
         self,

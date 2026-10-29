@@ -1,0 +1,17 @@
+#!/bin/bash
+#SBATCH --job-name=memr2_8s_ema
+#SBATCH --output=/gpfs/radev/home/wf287/scratch/memory_r2/logs/slurm_%x_%j.out
+#SBATCH --partition=gpu --qos=qos_nmi --time=07:00:00
+#SBATCH --nodes=1 --ntasks=1 --gres=gpu:h200:2 --cpus-per-task=24 --mem=500G
+#SBATCH hetjob
+#SBATCH --partition=gpu --qos=qos_nmi --time=07:00:00
+#SBATCH --nodes=1 --ntasks=1 --gres=gpu:h100:1 --cpus-per-task=8 --mem=160G
+#
+# 8-session ablation, 10 epochs, 2x H200 policy + 1x H100 gpt-oss (see train_memory_h200x2_h100x1.sbatch).
+# Scheme 3: fact extractor generates with an EMA (m=0.99, per optimizer step) of the jointly trained policy.
+# Same DATA_SEED across the ablations (train_8sess_{insert,insert_downweight,joint,ema}.sbatch) so they share the split.
+# Submit: sbatch scripts/train/0-8sess/train_8sess_ema.sbatch
+
+export STAGES_OVERRIDE=8 NUM_EPOCHS=10 DATA_SEED=2843377488 COMPRESSION_PENALTY=0.3
+export EMA_MOMENTUM=0.99 EXP_TAG=ema0.99
+source /gpfs/radev/project/q_chen/wf287/memory_r2/scripts/train/train_memory_h200x2_h100x1.sbatch

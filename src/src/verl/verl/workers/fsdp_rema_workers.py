@@ -477,6 +477,15 @@ class ActorRolloutRefWorker(Worker):
                 config=self.config.actor,
                 actor_module=self.actor_module_fsdp,
                 actor_optimizer=self.actor_optimizer)
+            ema_momentum = self.config.get('ema_momentum', None)
+            if ema_momentum:
+                # Momentum-encoder fact extractor: the fact-extraction role is generated with an EMA of the
+                # actor weights, updated after every optimizer step (DataParallelReMAPPOActor.init_ema).
+                ema_init_path = self.config.get('ema_init_path', None)
+                init_params = None
+                if ema_init_path:
+                    init_params = torch.load(os.path.join(ema_init_path, self._ema_file_name()), map_location='cpu')
+                self.actor.init_ema(float(ema_momentum), init_params)
 
         if self._is_rollout:
             self.rollout, self.rollout_sharding_manager = self._build_rollout()
@@ -663,6 +672,10 @@ class ActorRolloutRefWorker(Worker):
             print(f"Rank {self.rank}: Loading FSDP model to GPU...")
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
             print(f"Rank {self.rank}: Model loaded to GPU")
+        use_ema = self._is_actor and self.actor.ema_params is not None
+        if use_ema:
+            theta_weights = self._full_bf16_state_dict()
+            ema_weights = self._full_bf16_state_dict(self.actor.ema_params)
 
         meta_info = {
             'eos_token_id':
@@ -699,6 +712,9 @@ class ActorRolloutRefWorker(Worker):
             # print(f"  agent_roles: {prompts.meta_info['agent_roles']}")
             # print(f"  system_prompts keys: {list(prompts.meta_info['system_prompts'].keys())}")
             
+            if use_ema:
+                # vLLM now holds theta; the fact extractor (agent_roles[0]) generates with the EMA.
+                self.rollout.set_role_weights({prompts.meta_info['agent_roles'][0]: ema_weights}, theta_weights)
             output = self.rollout.multi_turn_generate_sequences(
                 prompts=prompts,
                 tokenizer=self.tokenizer,
@@ -708,6 +724,9 @@ class ActorRolloutRefWorker(Worker):
                 system_prompts=prompts.meta_info['system_prompts'],
                 epoch=prompts.batch['epoch'],
             )
+            if use_ema:
+                self.rollout.set_role_weights(None, None)
+                del theta_weights, ema_weights
             # print(f"Rank {self.rank}: rollout.multi_turn_generate_sequences completed")
             # print(f"Rank {self.rank}: Output non_tensor_batch keys: {list(output.non_tensor_batch.keys())}")
             
@@ -808,6 +827,29 @@ class ActorRolloutRefWorker(Worker):
 
         return output
 
+    def _ema_file_name(self):
+        return f'ema_world_size_{self.world_size}_rank_{self.rank}.pt'
+
+    @torch.no_grad()
+    def _full_bf16_state_dict(self, flat_params=None):
+        """Full (unsharded) bf16 actor weights with HF names, on this GPU. With flat_params (aligned
+        with actor_module_fsdp.parameters()), returns those weights instead of the actor's.
+        Collective across FSDP ranks; the actor must be on GPU."""
+        params = list(self.actor_module_fsdp.parameters())
+        if flat_params is not None:
+            backup = [p.data.clone() for p in params]
+            for p, w in zip(params, flat_params):
+                p.data.copy_(w)
+        full = {}
+        for name, value in self.actor_module_fsdp.state_dict().items():
+            if hasattr(value, 'full_tensor'):
+                value = value.full_tensor()
+            full[name] = value.to(torch.cuda.current_device(), dtype=torch.bfloat16)
+        if flat_params is not None:
+            for p, b in zip(params, backup):
+                p.data.copy_(b)
+        return full
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self,
                         local_path,
@@ -825,6 +867,10 @@ class ActorRolloutRefWorker(Worker):
             hdfs_path=hdfs_path,
             global_step=global_step,
             remove_previous_ckpt=remove_previous_ckpt)
+        if self.actor.ema_params is not None:
+            # bf16 is enough for evaluating with the EMA; training does not resume from it.
+            torch.save([e.to(torch.bfloat16) for e in self.actor.ema_params],
+                       os.path.join(local_path, self._ema_file_name()))
 
         torch.distributed.barrier()
         if self._is_offload_param:

@@ -154,6 +154,7 @@ def _wrap_before(fn, hook):
         hook()
         return fn(*args, **kwargs)
 
+    wrapped.__wrapped__ = fn
     return wrapped
 
 
