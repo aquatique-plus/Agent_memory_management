@@ -127,7 +127,8 @@ def generate_qa_prompt(
     top_k_per_speaker: int = 5,
     similarity_threshold: float = 0.3,
     use_similarity: bool = True,
-    prompt_template_path: Optional[str] = None
+    prompt_template_path: Optional[str] = None,
+    return_contents: bool = False,
 ) -> Tuple[str, List[str], List[str]]:
     """
     Generate the complete prompt for question answering based on memories.
@@ -193,4 +194,8 @@ def generate_qa_prompt(
     # prompt = prompt.replace("{{session_time}}", session_time)
 
     # Return separate ordered lists for each speaker to preserve individual rankings
+    if return_contents:
+        # Also return the content of every memory placed in the prompt (both speakers).
+        contents = [m["content"] for m in speaker_1_memories + speaker_2_memories]
+        return prompt, speaker_1_dia_ids, speaker_2_dia_ids, contents
     return prompt, speaker_1_dia_ids, speaker_2_dia_ids

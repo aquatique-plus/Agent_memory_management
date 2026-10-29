@@ -18,6 +18,16 @@ if [ "$ANSWER_AGENT_TIMESHARE" != "1" ]; then
     : "${SERVER_NODE:?}" "${SERVER_SRUN_ARGS:?}"
 fi
 POLICY_EXTRA_FLAGS=${POLICY_EXTRA_FLAGS:-}
+# Experiment-specific hydra overrides (training and final test) and a run-name suffix for them.
+EXTRA_FLAGS=${EXTRA_FLAGS:-}
+EXP_TAG=${EXP_TAG:-}
+# Policy-loss ratio/clip granularity (token|turn) and aggregation (turn|trajectory|token|seq-sum-norm).
+# Dr. GRPO: CLIP_MODE=token AGG_MODE=seq-sum-norm with +actor_rollout_ref.actor.loss_scale_factor in EXTRA_FLAGS.
+CLIP_MODE=${CLIP_MODE:-turn}
+AGG_MODE=${AGG_MODE:-turn}
+# Set (e.g. 0.99) to generate the fact-extraction role with an EMA of the policy weights; the final
+# test then loads the EMA saved with the best checkpoint.
+EMA_MOMENTUM=${EMA_MOMENTUM:-}
 
 TRAIN_SCRIPTS=/gpfs/radev/project/q_chen/wf287/memory_r2/scripts/train
 REPO=/gpfs/radev/project/q_chen/wf287/memory_r2/src
@@ -111,7 +121,8 @@ mkdir -p $DATASET_DIR $TMPDIR $RAY_TMPDIR $SCRATCH_DIR $HF_HOME $HF_DATASETS_CAC
          $EMBEDDING_CACHE_DIR $MEMORY_CACHE_DIR $MEMORY_CACHE_DIR_VAL $MEMORY_CACHE_DIR_TEST \
          $OPENAI_CACHE_DIR $TEACHER_CACHE_DIR
 
-export DATA_SEED=$(echo "$JOB_ID" | cksum | awk '{print $1}')
+# Fix DATA_SEED to compare runs on the same conversation split.
+export DATA_SEED=${DATA_SEED:-$(echo "$JOB_ID" | cksum | awk '{print $1}')}
 echo "[train] DATA_SEED=$DATA_SEED"
 
 export HYDRA_FULL_ERROR=1
@@ -182,7 +193,7 @@ LAM_TOKEN_LEVEL=1.0
 GAMMA_TURN_LEVEL=1.0
 REPLAY_MIX_RATIO=0
 TEST_SAVE_FREQ=5
-NUM_EPOCHS=50
+NUM_EPOCHS=${NUM_EPOCHS:-50}
 PPO_EPOCHS=2
 REWARD_TYPE=persession
 COMPRESSION_PENALTY=${COMPRESSION_PENALTY:-0.3}
@@ -246,8 +257,8 @@ set_common_flags() {
         actor_rollout_ref.actor.ppo_mini_batch_size=32
         actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8
         actor_rollout_ref.actor.clip_ratio=$CLIP_RATIO
-        actor_rollout_ref.actor.clip_mode=turn
-        actor_rollout_ref.actor.agg_mode=turn
+        actor_rollout_ref.actor.clip_mode=$CLIP_MODE
+        actor_rollout_ref.actor.agg_mode=$AGG_MODE
         actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8
         actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8
         actor_rollout_ref.rollout.tensor_model_parallel_size=1
@@ -272,6 +283,8 @@ set_common_flags() {
         algorithm.filter_groups.enable=True
         trainer.logger='["console","wandb"]'
         $POLICY_EXTRA_FLAGS
+        $EXTRA_FLAGS
+        ${EMA_MOMENTUM:++actor_rollout_ref.ema_momentum=$EMA_MOMENTUM}
     )
 }
 
@@ -284,7 +297,7 @@ preprocess() {
 for STAGE_SESSIONS in "${STAGES[@]}"; do
     echo "[train] STARTING STAGE: $STAGE_SESSIONS sessions (model: $CURRENT_MODEL_PATH)"
 
-    export STAGE_EXP_NAME="curr_${STAGE_SESSIONS}sess_${JOB_ID}_${MAX_NUM_TURNS}turns_${PPO_EPOCHS}ppo_Kl${kl_loss_coef}_${REWARD_TYPE}_${COMPRESSION_PENALTY}addcomp_turn_${algorithm}_${NUM_TRAIN_CONVS}convs${num_rollouts}r_innergrpo${INNER_GPRO_FRAC}sampleQA_vanillaoss120b"
+    export STAGE_EXP_NAME="curr_${STAGE_SESSIONS}sess_${JOB_ID}_${MAX_NUM_TURNS}turns_${PPO_EPOCHS}ppo_Kl${kl_loss_coef}_${REWARD_TYPE}_${COMPRESSION_PENALTY}addcomp_turn_${algorithm}_${NUM_TRAIN_CONVS}convs${num_rollouts}r_innergrpo${INNER_GPRO_FRAC}sampleQA_vanillaoss120b${EXP_TAG:+_$EXP_TAG}"
     export HYDRA_RUN_DIR=$WORKSPACE/hydra_${STAGE_EXP_NAME}
     mkdir -p "$HYDRA_RUN_DIR"
 
@@ -339,6 +352,7 @@ PYTHONUNBUFFERED=1 python -m verl.rema_trainer.main_ppo \
     +trainer.max_sessions=32 \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     +trainer.test_only=True \
+    ${EMA_MOMENTUM:++actor_rollout_ref.ema_init_path=$REPO/${SHARDED_PATH#./}} \
     hydra.run.dir=$HYDRA_RUN_DIR 2>&1 | tee "$LOG_DIR/${TEST_EXP_NAME}.log"
 
 echo "[train] ALL STAGES AND FINAL TEST COMPLETE"

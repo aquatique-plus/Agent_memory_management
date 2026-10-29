@@ -188,11 +188,12 @@ def process_single_qa(qa_pair, memory, speakers, session_time, reward_cfg=None):
     category = qa_pair.get('category', 0)
 
     # Generate prompt for memory retrieval (to get dia_ids)
-    prompt, speaker_1_dia_ids, speaker_2_dia_ids = generate_qa_prompt(memory, speaker_1=speakers[0], speaker_2=speakers[1], 
+    prompt, speaker_1_dia_ids, speaker_2_dia_ids, retrieved_contents = generate_qa_prompt(memory, speaker_1=speakers[0], speaker_2=speakers[1], 
                                              question=question, session_time=session_time, 
                                              top_k_per_speaker=reward_cfg.get('qa_top_k_per_speaker', 20),
                                              similarity_threshold=reward_cfg.get('qa_similarity_threshold', 0.0),
-                                             use_similarity=True)
+                                             use_similarity=True,
+                                             return_contents=True)
     response = judge_with_llm(prompt)
     predicted_answer = extract_answer_from_text(response)
 
@@ -211,6 +212,7 @@ def process_single_qa(qa_pair, memory, speakers, session_time, reward_cfg=None):
         'evidence': evidence,
         'speaker_1_dia_ids': speaker_1_dia_ids,
         'speaker_2_dia_ids': speaker_2_dia_ids,
+        'retrieved_contents': retrieved_contents,
         'prompt': prompt
     }
 
@@ -321,6 +323,8 @@ def locomo_score(qa_pairs: list[dict], conv_id: int, chunk_id: int, speakers: li
     
     # Per-session tracking for dense rewards
     session_f1_scores = {}  # {session_id: [f1_scores]}
+    retrieved_by_session = {}  # {session_id: set of retrieved memory contents}
+    retrieved_all = set()
 
     # Calculate session-level evidence coverage
     # Compare memory's dia_ids_set against session_evidences needed for this session
@@ -450,6 +454,9 @@ def locomo_score(qa_pairs: list[dict], conv_id: int, chunk_id: int, speakers: li
             if s not in session_f1_scores:
                 session_f1_scores[s] = []
             session_f1_scores[s].append(question_score)
+            # Memory contents seen by the QAs behind each session's reward (unretrieved-fact down-weighting).
+            retrieved_by_session.setdefault(s, set()).update(result['retrieved_contents'])
+        retrieved_all.update(result['retrieved_contents'])
 
         # Accumulate scores for averaging
         qa_scores += question_score
@@ -708,6 +715,9 @@ def locomo_score(qa_pairs: list[dict], conv_id: int, chunk_id: int, speakers: li
     else:
         # print(f"[LocomoScore] No dia_ids_affected_per_turn provided, skipping turn-level reward computation")
         pass
+
+    tracking_metrics['retrieved_contents_by_session'] = retrieved_by_session
+    tracking_metrics['retrieved_contents'] = retrieved_all
 
     memory_info = {
         "key": key,
@@ -1252,4 +1262,10 @@ class ReMARewardManager:
         # print("="*80)
         # print("REWARD MANAGER __call__ COMPLETED")
         # print("="*80 + "\n")
+        # Per data row: ({session_id: retrieved contents}, all retrieved contents); read by the trainer
+        # for unretrieved-fact down-weighting.
+        self.last_retrieved_contents = [
+            (m.get('retrieved_contents_by_session', {}), m.get('retrieved_contents', set()))
+            for m in tracking_metrics_list
+        ]
         return reward_tensor_map

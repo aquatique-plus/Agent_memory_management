@@ -264,10 +264,12 @@ def compute_bi_level_gae_advantage_return(
 def compute_grpo_outcome_advantage(token_level_rewards: torch.Tensor,
                                    eos_mask: torch.Tensor,
                                    index: torch.Tensor,
-                                   epsilon: float = 1e-6):
+                                   epsilon: float = 1e-6,
+                                   norm_adv_by_std: bool = True):
     """
     Compute advantage for GRPO, operating only on Outcome reward 
     (with only one scalar reward for each response).
+    norm_adv_by_std=False gives the Dr. GRPO advantage (reward minus group mean).
     Args:
         token_level_rewards: `(torch.Tensor)`
             shape: (bs, response_length)
@@ -301,7 +303,10 @@ def compute_grpo_outcome_advantage(token_level_rewards: torch.Tensor,
             else:
                 raise ValueError(f"no score in prompt index: {idx}")
         for i in range(bsz):
-            scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+            if norm_adv_by_std:
+                scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+            else:
+                scores[i] = scores[i] - id2mean[index[i]]
             # try MaxRL
             # scores[i] = (scores[i] - id2mean[index[i]]) / (id2mean[index[i]] + epsilon)
         scores = scores.unsqueeze(-1).tile([1, response_length]) * eos_mask
@@ -533,6 +538,8 @@ def compute_policy_loss(
     log_ratio_clip_c=3.0,
     agg_mode: str = 'token',
     clip_mode: str = 'token',
+    token_weights=None,
+    loss_scale_factor=None,
 ):
     """Adapted from https://github.com/huggingface/trl/blob/main/trl/trainer/ppo_trainer.py#L1122
 
@@ -565,10 +572,14 @@ def compute_policy_loss(
         + f" but get the value: {log_ratio_clip_c}."
     )
 
-    assert agg_mode in ['token', 'turn', 'trajectory']
+    assert agg_mode in ['token', 'turn', 'trajectory', 'seq-sum-norm']
     assert clip_mode in ['token', 'turn']
 
     negative_approx_kl = log_prob - old_log_prob
+    if token_weights is not None:
+        # Per-token weights (unretrieved-fact down-weighting) apply only to positive advantages, so tokens
+        # are not reinforced by a good outcome they did not contribute to but are still fully penalized.
+        token_weights = torch.where(advantages > 0, token_weights, torch.ones_like(token_weights))
     if clip_mode == 'token':
         if log_ratio_clip_c is not None:
             log_ratio_clipfrac = verl_F.masked_mean(torch.gt(negative_approx_kl, log_ratio_clip_c).float(), eos_mask)
@@ -600,12 +611,18 @@ def compute_policy_loss(
         )
 
         pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+        if token_weights is not None:
+            pg_losses = pg_losses * token_weights
         
         if agg_mode == 'token':
             pg_loss = verl_F.masked_mean(pg_losses, eos_mask)
         elif agg_mode == 'trajectory':
             seq_losses = torch.sum(pg_losses * eos_mask, dim=-1) / torch.sum(eos_mask, dim=-1)  # token-mean
             pg_loss = torch.mean(seq_losses)  # seq-mean
+        elif agg_mode == 'seq-sum-norm':
+            # Dr. GRPO: token-sum per sequence over a fixed constant instead of the sequence's own length.
+            assert loss_scale_factor is not None, "seq-sum-norm needs loss_scale_factor"
+            pg_loss = torch.sum(pg_losses * eos_mask) / (pg_losses.shape[0] * loss_scale_factor)
         elif agg_mode == 'turn':
             with torch.no_grad():
                 max_turns = step_id.max().item() + 1                
@@ -639,7 +656,9 @@ def compute_policy_loss(
         # Then, we use turn_masks to sum these KLs for each turn across the sequence length.
         # The result, turn_level_negative_approx_kl, will have shape (bsz, max_turns).
         assert torch.all((step_id != -100) == (eos_mask!=0))
-        negative_approx_kl_each_turn = (negative_approx_kl.unsqueeze(-1) * turn_masks) # (bsz, seq_len, max_turns)
+        weighted_negative_approx_kl = negative_approx_kl if token_weights is None else negative_approx_kl * token_weights
+        # Still divided by the turn's token count, so down-weighted tokens shrink the turn's gradient.
+        negative_approx_kl_each_turn = (weighted_negative_approx_kl.unsqueeze(-1) * turn_masks) # (bsz, seq_len, max_turns)
         turn_level_avg_negative_approx_kl = negative_approx_kl_each_turn.sum(dim=1) * turn_weights # (bsz, max_turns)
         turn_level_avg_advantages = (advantages.unsqueeze(-1) * turn_masks).sum(dim=1) * turn_weights  # (bsz, max_turns)
 

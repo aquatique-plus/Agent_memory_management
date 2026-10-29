@@ -48,6 +48,9 @@ class DataParallelReMAPPOActor(BasePPOActor):
         super().__init__(config)
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
+        # Momentum (EMA) copy of this rank's flat-param shards, fp32 on CPU; see init_ema.
+        self.ema_momentum = None
+        self.ema_params = None
         self.use_remove_padding = self.config.get('use_remove_padding', False)
         print(f'Actor use_remove_padding={self.use_remove_padding}')
         self.ulysses_sequence_parallel_size = self.config.ulysses_sequence_parallel_size
@@ -182,7 +185,24 @@ class DataParallelReMAPPOActor(BasePPOActor):
         else:
             grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
         self.actor_optimizer.step()
+        if self.ema_params is not None:
+            self._update_ema()
         return grad_norm
+
+    @torch.no_grad()
+    def init_ema(self, momentum: float, init_params=None):
+        """Start the EMA at the current weights, or at init_params (a list aligned with
+        actor_module.parameters(), e.g. loaded from a checkpoint)."""
+        self.ema_momentum = momentum
+        source = init_params if init_params is not None else [p.detach() for p in self.actor_module.parameters()]
+        self.ema_params = [t.to('cpu', dtype=torch.float32).clone() for t in source]
+
+    @torch.no_grad()
+    def _update_ema(self):
+        # ema <- m * ema + (1 - m) * theta, one flat param (~one decoder layer) at a time on CPU,
+        # so no extra GPU memory is needed during the update phase.
+        for ema, p in zip(self.ema_params, self.actor_module.parameters()):
+            ema.mul_(self.ema_momentum).add_(p.detach().to('cpu', dtype=torch.float32), alpha=1 - self.ema_momentum)
     
     def compute_log_prob(self, data: DataProto) -> Dict[str, torch.Tensor]:
         self.actor_module.eval()
@@ -269,6 +289,8 @@ class DataParallelReMAPPOActor(BasePPOActor):
         select_keys = ['labels', 'input_ids', 'attention_mask', 'position_ids', 'old_log_probs', 'advantages', 'step_ids']
         if self.config.use_kl_loss:
             select_keys.append('ref_log_prob')
+        if 'token_weights' in data.batch.keys():
+            select_keys.append('token_weights')
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = 'multi_modal_inputs' in data.non_tensor_batch.keys()
 
@@ -317,6 +339,7 @@ class DataParallelReMAPPOActor(BasePPOActor):
                     old_log_prob = data['old_log_probs']
                     advantages = data['advantages']
                     step_id = data['step_ids']
+                    token_weights = data['token_weights'] if 'token_weights' in data.keys() else None
 
                     clip_ratio = self.config.clip_ratio
                     entropy_coeff = self.config.entropy_coeff
@@ -339,7 +362,9 @@ class DataParallelReMAPPOActor(BasePPOActor):
                         clip_ratio_c=clip_ratio_c,
                         log_ratio_clip_c=log_ratio_clip_c,
                         agg_mode=agg_mode,
-                        clip_mode=clip_mode
+                        clip_mode=clip_mode,
+                        token_weights=token_weights,
+                        loss_scale_factor=self.config.get('loss_scale_factor', None),
                     )
                     # compute entropy loss from entropy
                     entropy_loss = verl_F.masked_mean(entropy, label_mask)
