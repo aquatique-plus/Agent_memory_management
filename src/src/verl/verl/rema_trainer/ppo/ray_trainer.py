@@ -18,6 +18,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import shutil
 from pathlib import Path
 import uuid
 import jsonlines
@@ -350,7 +351,8 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         step_mask = data.batch['step_ids'] != -100
         advantages, returns = core_algos.compute_grpo_outcome_advantage(token_level_rewards=grpo_sparse_rewards,
                                                                         eos_mask=step_mask,
-                                                                        index=index)
+                                                                        index=index,
+                                                                        norm_adv_by_std=data.meta_info.get('norm_adv_by_std', True))
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
     elif adv_estimator == AdvantageEstimator.GRPO_MAXRL:
@@ -504,6 +506,75 @@ def merge_roles_data(data: DataProto) -> DataProto:
     
     merged_data = DataProto.from_dict(new_tensor_batch, non_tensors=new_non_tensor_batch, meta_info=data.meta_info)
     return merged_data
+
+_BYTE_DECODER = None
+
+
+def _token_bytes(tokenizer, token_ids):
+    """UTF-8 bytes of each token of a byte-level BPE tokenizer (Qwen2)."""
+    global _BYTE_DECODER
+    if _BYTE_DECODER is None:
+        from transformers.models.gpt2.tokenization_gpt2 import bytes_to_unicode
+        _BYTE_DECODER = {c: b for b, c in bytes_to_unicode().items()}
+    pieces = []
+    for tok in tokenizer.convert_ids_to_tokens(token_ids):
+        if tok is None:
+            pieces.append(b'')
+        elif all(c in _BYTE_DECODER for c in tok):
+            pieces.append(bytes(_BYTE_DECODER[c] for c in tok))
+        else:  # special token
+            pieces.append(tok.encode('utf-8'))
+    return pieces
+
+
+def _fact_object_spans(text):
+    """(start, end, fact) character spans of the {..., "fact": ...} objects in a fact-extractor output."""
+    decoder = json.JSONDecoder()
+    spans = []
+    i = text.find('{')
+    while i != -1:
+        try:
+            obj, end = decoder.raw_decode(text, i)
+        except ValueError:
+            obj, end = None, i + 1
+        if isinstance(obj, dict) and isinstance(obj.get('fact'), str) and obj.get('fact'):
+            spans.append((i, end, obj['fact']))
+            i = text.find('{', end)
+        else:
+            i = text.find('{', i + 1)
+    return spans
+
+
+def compute_unretrieved_fact_token_weights(batch: DataProto, retrieved_per_row, tokenizer, weight: float) -> torch.Tensor:
+    """Token weights for the fact-extractor (meta_thinking) rows in insert-only mode: tokens of a fact whose
+    memory entry was not retrieved by any QA behind the row's reward get `weight`, all others 1.
+
+    In insert-only mode each memory entry's content is the fact text, so a fact counts as retrieved when its
+    text is in that row's set of retrieved memory contents. Weights are aligned with `labels`/`step_ids`.
+    """
+    labels = batch.batch['meta_thinking_labels']
+    step_ids = batch.batch['meta_thinking_step_ids']
+    weights = torch.ones_like(labels, dtype=torch.float32)
+    for row, retrieved in enumerate(retrieved_per_row):
+        row_steps = step_ids[row]
+        for turn in torch.unique(row_steps[row_steps != -100]).tolist():
+            positions = (row_steps == turn).nonzero(as_tuple=True)[0]
+            pieces = _token_bytes(tokenizer, labels[row, positions].tolist())
+            starts, offset = [], 0
+            for piece in pieces:
+                starts.append(offset)
+                offset += len(piece)
+            text = b''.join(pieces).decode('utf-8', errors='replace')
+            for start, end, fact in _fact_object_spans(text):
+                if fact in retrieved:
+                    continue
+                byte_start = len(text[:start].encode('utf-8'))
+                byte_end = len(text[:end].encode('utf-8'))
+                for k, piece in enumerate(pieces):
+                    if starts[k] < byte_end and starts[k] + len(piece) > byte_start:
+                        weights[row, positions[k]] = weight
+    return weights
+
 
 @contextmanager
 def _timer(name: str, timing_raw: Dict[str, float]):
@@ -1706,6 +1777,12 @@ class RayReMATrainer(object):
         self.actor_rollout_wg = all_wg['actor_rollout']
         self.actor_rollout_wg.init_model()
 
+    def _set_fact_token_weights(self, batch: DataProto, retrieved_per_row, weight: float):
+        batch.batch['meta_thinking_token_weights'] = compute_unretrieved_fact_token_weights(
+            batch, retrieved_per_row, self.tokenizer, weight)
+        # merge_roles_data pairs role-prefixed keys, so the executor rows need the key too.
+        batch.batch['reasoning_token_weights'] = torch.ones_like(batch.batch['reasoning_labels'], dtype=torch.float32)
+
     def _save_checkpoint(self):
         # path: given_path + `/global_step_{global_steps}` + `/actor`
         local_global_step_folder = os.path.join(self.config.trainer.default_local_dir,
@@ -1735,11 +1812,29 @@ class RayReMATrainer(object):
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
 
+        # best-on-val tracking, so a resumed run keeps selecting against the same best
+        with open(os.path.join(local_global_step_folder, 'trainer_state.json'), 'w') as f:
+            json.dump({'best_val_acc': self.best_val_acc,
+                       'best_global_step': self.best_global_step,
+                       'patience_counter': self.patience_counter}, f)
+
         # latest checkpointed iteration tracker (for atomic usage)
         local_latest_checkpointed_iteration = os.path.join(self.config.trainer.default_local_dir,
                                                            'latest_checkpointed_iteration.txt')
         with open(local_latest_checkpointed_iteration, 'w') as f:
             f.write(str(self.global_steps))
+
+        # With save_freq below test_freq (checkpoint every step for resume), keep only the checkpoints
+        # that best_checkpoint_info.txt can point to (validated steps) plus the latest one.
+        prev_step = getattr(self, '_last_saved_step', None)
+        test_freq = self.config.trainer.test_freq
+        if self.config.trainer.get('prune_unvalidated_ckpts', False) and prev_step is not None \
+                and prev_step != self.global_steps and test_freq > 0 and prev_step % test_freq != 0 \
+                and prev_step != self.best_global_step:
+            prev_folder = os.path.join(self.config.trainer.default_local_dir, f'global_step_{prev_step}')
+            print(f'Removing unvalidated checkpoint {prev_folder}')
+            shutil.rmtree(prev_folder, ignore_errors=True)
+        self._last_saved_step = self.global_steps
 
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == 'disable':
@@ -1785,14 +1880,23 @@ class RayReMATrainer(object):
             self.critic_wg.load_checkpoint(critic_path,
                                            del_local_after_load=self.config.trainer.del_local_ckpt_after_load)
 
-        # load dataloader,
-        # TODO: from remote not implemented yet
-        dataloader_local_path = os.path.join(global_step_folder, 'data.pt')
-        if os.path.exists(dataloader_local_path):
-            dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
-            self.train_dataloader.load_state_dict(dataloader_state_dict)
+        # The dataloader state (data.pt) is deliberately not restored: fit() updates only at the final
+        # chunk, so every step consumes exactly one full epoch and a checkpoint always sits on an epoch
+        # boundary. Restoring the saved mid-iteration state would make the first resumed epoch yield
+        # nothing and silently drop a step; fit() instead restarts at epoch == global_steps.
+
+        trainer_state_path = os.path.join(global_step_folder, 'trainer_state.json')
+        if os.path.exists(trainer_state_path):
+            with open(trainer_state_path) as f:
+                trainer_state = json.load(f)
+            self.best_val_acc = trainer_state['best_val_acc']
+            self.best_global_step = trainer_state['best_global_step']
+            self.patience_counter = trainer_state['patience_counter']
+            print(f'Restored best val acc {self.best_val_acc} at step {self.best_global_step}, '
+                  f'patience {self.patience_counter}')
         else:
-            print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
+            print(f'Warning: no {trainer_state_path}; best-checkpoint tracking restarts from scratch')
+        self._last_saved_step = self.global_steps
 
     def _balance_batch(self, batch: DataProto, metrics, logging_prefix='global_seqlen'):
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
@@ -1827,6 +1931,13 @@ class RayReMATrainer(object):
         # print("="*80)
 
         self.global_steps = 0
+
+        # Insert-only only: weight for the tokens of facts that no QA behind their reward retrieved.
+        unretrieved_fact_weight = self.config.actor_rollout_ref.actor.get('unretrieved_fact_weight', None)
+        if unretrieved_fact_weight is not None:
+            assert self.config.actor_rollout_ref.rollout.get('insert_only', False), (
+                "unretrieved_fact_weight needs rollout.insert_only: memory entries must be the facts themselves")
+            unretrieved_fact_weight = float(unretrieved_fact_weight)
         
         # Best validation tracking
         self.best_val_acc = -1.0
@@ -1837,6 +1948,14 @@ class RayReMATrainer(object):
         # print("\n[FIT] Loading checkpoint...")
         self._load_checkpoint()
         # print(f"[FIT] Checkpoint loaded. Starting from global_steps={self.global_steps}")
+        resumed_steps = self.global_steps
+        max_patience = self.config.trainer.get('early_stop_patience', 3)
+        if resumed_steps and not self.config.trainer.get('test_only', False) and (
+                resumed_steps >= self.total_training_steps or
+                (max_patience > 0 and self.patience_counter >= max_patience)):
+            print(f'[FIT] Checkpoint at step {resumed_steps} already ended training '
+                  f'(total {self.total_training_steps}, patience {self.patience_counter}/{max_patience}); nothing to do.')
+            return
 
         if self.config.trainer.get('fork_wandb_id', None) is not None:
             fork_wandb_id = self.config.trainer.fork_wandb_id
@@ -1868,7 +1987,8 @@ class RayReMATrainer(object):
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
-        if self.val_reward_fn is not None and self.config.trainer.get('val_before_train', True):
+        # (skipped on resume: the step-0 baseline was already logged by the first run)
+        if self.val_reward_fn is not None and self.config.trainer.get('val_before_train', True) and resumed_steps == 0:
             # print("\n[FIT] Running initial validation before training...")
             val_metrics = self._validate()
             pprint(f'Initial validation metrics: {val_metrics}')
@@ -1929,7 +2049,9 @@ class RayReMATrainer(object):
         # print(f"\n[FIT] Starting training loop: {self.config.trainer.total_epochs} epochs, {len(self.train_dataloader)} batches per epoch")
         # print(f"[FIT] Total training steps: {self.total_training_steps}")
 
-        for epoch in range(self.config.trainer.total_epochs):
+        # One step == one epoch (see _load_checkpoint), so a resumed run continues at epoch == resumed_steps;
+        # the epoch also keys the memory snapshots.
+        for epoch in range(resumed_steps, self.config.trainer.total_epochs):
             # print(f"\n{'='*80}")
             # print(f"EPOCH {epoch + 1}/{self.config.trainer.total_epochs}")
             # print(f"{'='*80}")
@@ -2322,6 +2444,12 @@ class RayReMATrainer(object):
                                 propagated_reward, turn_mask, self.config.algorithm.gamma_turn_level)
 
                         # Keep TensorDict schema aligned with normal batches before final concat.
+                        if unretrieved_fact_weight is not None:
+                            # An inner row's reward uses all of its sampled QAs.
+                            self._set_fact_token_weights(
+                                inner_eval_batch,
+                                [retrieved_all for _, retrieved_all in getattr(self.reward_fn, '__wrapped__', self.reward_fn).last_retrieved_contents],
+                                unretrieved_fact_weight)
                         if 'source_rollout_idx' in inner_eval_batch.batch.keys():
                             inner_eval_batch.batch.pop('source_rollout_idx')
 
@@ -2377,6 +2505,22 @@ class RayReMATrainer(object):
                         terminal_batch.meta_info['memory_snapshot_suffix'] = ''
                         
                         reward_tensor_map = self.reward_fn(terminal_batch, compression_penalty=self.config.trainer.compression_penalty)
+                        if unretrieved_fact_weight is not None:
+                            # A session-s row is rewarded with per_session_f1[s] of its (sample, rollout) terminal row,
+                            # so its facts count as retrieved if a QA behind that session's F1 retrieved them.
+                            retrieved_by_key = {
+                                key: by_session
+                                for key, (by_session, _) in zip(terminal_keys_ordered, getattr(self.reward_fn, '__wrapped__', self.reward_fn).last_retrieved_contents)
+                            }
+                            for b in all_batches:
+                                rollout_idxs = b.batch['rollout_idx']
+                                rollout_idxs = rollout_idxs.cpu().tolist() if isinstance(rollout_idxs, torch.Tensor) else list(rollout_idxs)
+                                retrieved_per_row = [
+                                    retrieved_by_key[(sample_id, int(rollout_idx))].get(int(chunk_id), set())
+                                    for sample_id, rollout_idx, chunk_id in zip(
+                                        b.non_tensor_batch['sample_id'], rollout_idxs, b.non_tensor_batch['chunk_id'])
+                                ]
+                                self._set_fact_token_weights(b, retrieved_per_row, unretrieved_fact_weight)
                         # print(f"[STEP {self.global_steps}] Reward computed. Keys: {list(reward_tensor_map.keys())}")
                         
                         # Process metrics (logging only)
@@ -2630,11 +2774,19 @@ class RayReMATrainer(object):
                         # Concatenate everything for PPO update
                         # print(f"[STEP {self.global_steps}] Concatenating {len(all_batches)} batches for update...")
                         batch = DataProto.concat(all_batches + evaluated_inner_batches)
+                        if unretrieved_fact_weight is not None:
+                            fact_weights = batch.batch['meta_thinking_token_weights']
+                            fact_mask = batch.batch['meta_thinking_step_ids'] != -100
+                            metrics['train/unretrieved_fact_token_frac'] = (
+                                ((fact_weights < 1) & fact_mask).sum() / fact_mask.sum().clamp(min=1)).item()
                         
                         # Fix for DP chunking error: Ensure the final batch size (after role expansion) is perfectly 
                         # divisible by world_size by dropping dangling inner samples at the very end of the batch.
+                        # insert_only keeps only the fact-extractor rows (see merge below), so one row per sample.
+                        insert_only = self.config.actor_rollout_ref.rollout.get('insert_only', False)
+                        trained_roles = 1 if insert_only else len(agent_roles)
                         target_bsz_before_roles = len(batch.batch)
-                        while (target_bsz_before_roles * len(agent_roles)) % self.actor_rollout_wg.world_size != 0:
+                        while (target_bsz_before_roles * trained_roles) % self.actor_rollout_wg.world_size != 0:
                             target_bsz_before_roles -= 1
                             
                         if target_bsz_before_roles < len(batch.batch):
@@ -2652,6 +2804,12 @@ class RayReMATrainer(object):
                         # print(f"\n[STEP {self.global_steps}] Computing advantages (Trajectory Aggregated)...")
                         # Merge different role data into a single DataProto
                         merged_batch = merge_roles_data(batch)
+                        if self.config.actor_rollout_ref.rollout.get('insert_only', False):
+                            # Executor rows (second half, agent_roles[1]) are rule-based INSERTs: no gradient.
+                            import copy
+                            meta_info = copy.deepcopy(merged_batch.meta_info)
+                            merged_batch = merged_batch[:len(batch.batch)]
+                            merged_batch.meta_info = meta_info
 
                         # Recalculate global_token_num for the entire merged mega-batch
                         # This ensures the metadata has the correct length (2 * MegaBatchSize) 
@@ -2710,6 +2868,7 @@ class RayReMATrainer(object):
                         # print(f"[STEP {self.global_steps}] Computing advantages with {self.config.algorithm.adv_estimator}...")
                         batch.meta_info['gamma_turn_level'] = self.config.algorithm.gamma_turn_level
                         batch.meta_info['use_bilevel_gae'] = self.config.algorithm.get('use_bilevel_gae', False)
+                        batch.meta_info['norm_adv_by_std'] = self.config.algorithm.get('norm_adv_by_std_in_grpo', True)
                         batch = compute_advantage(batch,
                                                   adv_estimator=self.config.algorithm.adv_estimator,
                                                   gamma=self.config.algorithm.gamma_token_level,

@@ -187,6 +187,17 @@ if [ -n "${REMA_DUMP_QA:-}" ]; then
   echo "[test-eval] QA-dump enabled: dir=$REMA_QA_DUMP_DIR splits=$REMA_QA_DUMP_SPLITS run=$REMA_RUN_NAME"
 fi
 
+# Optional: log every memory-bank op (insert/update/delete/none, plus failed ops and
+# JSON parse failures) to $REMA_QA_DUMP_DIR/$REMA_RUN_NAME/memory_ops/<split>_pid<pid>.jsonl.
+# Set REMA_DUMP_MEMOPS=1; REMA_MEMOPS_SPLITS limits splits (default: all).
+if [ -n "${REMA_DUMP_MEMOPS:-}" ]; then
+  export REMA_DUMP_MEMOPS
+  export REMA_QA_DUMP_DIR=${REMA_QA_DUMP_DIR:-/gpfs/radev/home/wf287/scratch/memory_r2/qa_dumps}
+  export REMA_RUN_NAME=${REMA_RUN_NAME:-${RUN_TAG}_${RUN_TS}}
+  [ -n "${REMA_MEMOPS_SPLITS:-}" ] && export REMA_MEMOPS_SPLITS
+  echo "[test-eval] memory-op log enabled: $REMA_QA_DUMP_DIR/$REMA_RUN_NAME/memory_ops/"
+fi
+
 TEST_EXP_NAME="${RUN_TAG}_${RUN_TS}"
 export HYDRA_RUN_DIR=$TMPDIR/hydra_${TEST_EXP_NAME}
 mkdir -p $HYDRA_RUN_DIR

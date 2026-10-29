@@ -177,6 +177,8 @@ class TaskRunner:
                                 reward_fn=reward_fn,
                                 val_reward_fn=val_reward_fn)
         trainer.init_workers()
+        from verl.rema_trainer.answer_agent_timeshare import install_from_env
+        install_from_env(trainer)
         trainer.fit()
 
 

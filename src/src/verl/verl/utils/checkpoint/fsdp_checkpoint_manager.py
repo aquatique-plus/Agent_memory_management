@@ -167,4 +167,4 @@ class FSDPCheckpointManager(BaseCheckpointManager):
 
         torch.distributed.barrier()
 
-        self.previous_save_path = local_path
+        self.previous_saved_path = local_path

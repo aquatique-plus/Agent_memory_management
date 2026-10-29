@@ -38,7 +38,9 @@ from verl import DataProto
 from verl.protocol import collate_fn as data_proto_collate_fn
 from verl.utils.torch_functional import get_eos_mask, pad_2d_list_to_length
 from verl.rema_trainer.memory.memory_core.memory import Memory
-from verl.rema_trainer.memory.memory_core.memory_manager import MemoryManager
+from verl.rema_trainer.memory.memory_core.memory_manager import (
+    MemoryManager, memory_ops_dump_path, memory_snapshot_contents, dump_memory_ops,
+)
 from verl.rema_trainer.memory.memory_core.prompt_generator import format_turns_for_prompt, generate_memory_prompt_using_facts, format_memory_for_prompt
 from verl.rema_trainer.memory.utils.parse_response import extract_llm_json_from_response
 from verl.workers.rollout.base import BaseRollout
@@ -1116,8 +1118,14 @@ class vLLMRollout(BaseRollout):
 
                 # Generate responses for current role
                 # print(f"  Generating responses...")
-                current_outputs, num_gen_tokens, stop_reasons, resp_lens, prompt_lens = self._generate_role_responses(
-                    prompt_proto, tokenizer, response_length, **kwargs)
+                self._use_role_weights(role)
+                if role == agent_roles[1] and self.config.get('insert_only', False):
+                    # Insert-only ablation: the executor is not run; every extracted fact becomes an INSERT.
+                    current_outputs, num_gen_tokens, stop_reasons, resp_lens, prompt_lens = self._insert_all_facts_responses(
+                        [history[idx][-1]['content'] for idx in unfinished_indices], prompt_proto, tokenizer)
+                else:
+                    current_outputs, num_gen_tokens, stop_reasons, resp_lens, prompt_lens = self._generate_role_responses(
+                        prompt_proto, tokenizer, response_length, **kwargs)
                 if not (
                     len(current_outputs) == len(unfinished_indices)
                     and len(num_gen_tokens) == len(unfinished_indices)
@@ -1288,6 +1296,19 @@ class vLLMRollout(BaseRollout):
         sample_ids = prompt_data.non_tensor_batch["sample_id"]
         chunk_ids = prompt_data.non_tensor_batch["chunk_id"]
         turns_json = prompt_data.non_tensor_batch["turns_json"]
+        memops_path = memory_ops_dump_path(prompt_data.meta_info.get("split", "unknown"))
+
+        def _memops_meta(idx):
+            meta = {
+                'split': prompt_data.meta_info.get("split", "unknown"),
+                'conv_id': str(sample_ids[idx]),
+                'chunk_id': int(chunk_ids[idx]),
+                'turn': current_turn_id,
+            }
+            for key in ("epoch", "rollout_idx"):
+                if key in prompt_data.batch.keys():
+                    meta[key] = int(prompt_data.batch[key][idx])
+            return meta
         
         # If unfinished_indices not provided, assume all samples
         if unfinished_indices is None:
@@ -1331,6 +1352,8 @@ class vLLMRollout(BaseRollout):
                 rewards.append(0.0)
                 # print(f"Conv {sample_ids[idx]}, chunk {chunk_ids[idx]}: "
                 #       f"JSON parsing FAILED - Reward=0.0")
+                if memops_path:
+                    dump_memory_ops(memops_path, _memops_meta(idx), None, None, None, memories[idx], response_text)
                 continue
             
             # Attach turn metadata
@@ -1342,8 +1365,13 @@ class vLLMRollout(BaseRollout):
             # Record the parsed operations for downstream evaluation / judging
             memory_operations_per_sample[idx] = operations # list of dicts
 
+            # Pre-op contents so UPDATE/DELETE records show what they replaced
+            before = memory_snapshot_contents(memories[idx]) if memops_path else None
+
             # Execute operations (even if empty list)
             result = shared_manager.execute_batch(memories[idx], operations)
+            if memops_path:
+                dump_memory_ops(memops_path, _memops_meta(idx), operations, result, before, memories[idx])
             
             total_ops = result.get("total_commands", 0)
             successful_ops = result.get("successful", 0)
@@ -1580,6 +1608,44 @@ class vLLMRollout(BaseRollout):
 
         # return output_text_clean, num_gen_tokens, stop_reasons, resp_lens
         return vllm_output_text, num_gen_tokens, stop_reasons, resp_lens, prompt_lens
+
+    def set_role_weights(self, role_weights, default_weights):
+        """Generate each role in role_weights with its own state dict (HF names), and every other
+        role with default_weights, which must be what vLLM currently holds. Pass None to stop."""
+        self._role_weights = role_weights
+        self._default_weights = default_weights
+        self._loaded_weights = default_weights
+
+    def _use_role_weights(self, role):
+        if getattr(self, '_role_weights', None) is None:
+            return
+        weights = self._role_weights.get(role, self._default_weights)
+        if weights is self._loaded_weights:
+            return
+        model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
+        model.load_weights(weights.items())
+        # Cached prefixes were computed with the other weights.
+        self.inference_engine.reset_prefix_cache()
+        self._loaded_weights = weights
+
+    def _insert_all_facts_responses(self, facts_responses: List[str], prompt_proto: DataProto, tokenizer):
+        """Executor outputs for insert_only mode: one INSERT per extracted fact, in the same
+        return format as _generate_role_responses."""
+        outputs = []
+        for facts_response in facts_responses:
+            facts_data = extract_llm_json_from_response(facts_response)
+            facts = facts_data.get("facts", []) if facts_data.get("_parse_success", False) else []
+            operations = [
+                {"operation": "INSERT", "speaker": fact.get("speaker"), "content": fact.get("fact", ""),
+                 "dia_id": fact.get("dia_id")}
+                for fact in facts
+                if isinstance(fact, dict) and fact.get("fact")
+            ]
+            outputs.append(json.dumps({"operations": operations}, ensure_ascii=False))
+        num_gen_tokens = [len(tokenizer.encode(o, add_special_tokens=False)) for o in outputs]
+        stop_reasons = ["stop"] * len(outputs)
+        prompt_lens = prompt_proto.batch['attention_mask'].sum(dim=1).tolist()
+        return outputs, num_gen_tokens, stop_reasons, num_gen_tokens, prompt_lens
 
     def _update_history_and_check_finish(
         self,
