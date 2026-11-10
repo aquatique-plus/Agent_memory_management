@@ -1,12 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=prep_gpt_oss
-#SBATCH --partition=day
+#SBATCH --partition=devel
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
-#SBATCH --time=04:00:00
-#SBATCH --output=/gpfs/radev/home/wf287/scratch/memory_r2/logs/slurm_%x_%j.out
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=48G
+#SBATCH --time=06:00:00
+#SBATCH --output=/home/wf287/scratch_pi_qc88/wf287/memory_r2/logs/slurm_%x_%j.out
 #
 # One-time setup for the gpt-oss-120b answer agent used by train_memory.sbatch:
 #   1) pull the vLLM OpenAI-server image as a .sif (the memory_r2 conda env has vLLM 0.8.5,
@@ -21,14 +21,15 @@
 
 set -euo pipefail
 
-SCRATCH=/gpfs/radev/home/wf287/scratch/memory_r2
+SCRATCH=/home/wf287/scratch_pi_qc88/wf287/memory_r2
 VLLM_IMAGE_TAG=${VLLM_IMAGE_TAG:-v0.11.0}
 SIF_PATH=${SIF_PATH:-$SCRATCH/images/vllm-openai_${VLLM_IMAGE_TAG}.sif}
 TIKTOKEN_DIR=$SCRATCH/tiktoken_encodings
-export HF_HOME=/gpfs/radev/home/wf287/scratch/hf_cache
-CONDA_ENV=/gpfs/radev/home/wf287/project/conda_envs/memory_r2
+export HF_HOME=/home/wf287/scratch_pi_qc88/wf287/hf_cache
+export HF_HUB_DISABLE_XET=1   # hf-xet download workers got OOM-killed on this cluster
+CONDA_ENV=/home/wf287/project_pi_qc88/wf287/conda-envs/memory_r2
 
-set -a; source /gpfs/radev/project/q_chen/wf287/memory_r2/src/.env 2>/dev/null || true; set +a
+set -a; source /home/wf287/project_pi_qc88/wf287/memory_r2/src/.env 2>/dev/null || true; set +a
 export HF_TOKEN="${HF_TOKEN:?Set HF_TOKEN via env or sourced .env file}"
 
 mkdir -p "$(dirname "$SIF_PATH")" "$TIKTOKEN_DIR" "$HF_HOME"
@@ -40,7 +41,10 @@ if [ ! -f "$SIF_PATH" ]; then
     mkdir -p "$APPTAINER_CACHEDIR" "$APPTAINER_TMPDIR"
     trap 'rm -rf "$APPTAINER_CACHEDIR" "$APPTAINER_TMPDIR"' EXIT
     echo "[prep] pulling docker://vllm/vllm-openai:$VLLM_IMAGE_TAG -> $SIF_PATH"
-    apptainer pull "$SIF_PATH.partial" "docker://vllm/vllm-openai:$VLLM_IMAGE_TAG"
+    # mksquashfs sizes its buffers from the node's RAM and CPU count, not the job's cgroup: uncapped it
+    # got OOM-killed at 32G (job 31308864). build (unlike pull) passes these caps through.
+    apptainer build --mksquashfs-args "-mem 4G -processors $SLURM_CPUS_PER_TASK" \
+        "$SIF_PATH.partial" "docker://vllm/vllm-openai:$VLLM_IMAGE_TAG"
     mv "$SIF_PATH.partial" "$SIF_PATH"
 else
     echo "[prep] image already present: $SIF_PATH"

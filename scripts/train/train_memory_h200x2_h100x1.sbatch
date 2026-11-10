@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=memr2_train_het
-#SBATCH --output=/gpfs/radev/home/wf287/scratch/memory_r2/logs/slurm_%x_%j.out
-#SBATCH --partition=gpu --qos=qos_nmi --time=2-00:00:00
-#SBATCH --nodes=1 --ntasks=1 --gres=gpu:h200:2 --cpus-per-task=24 --mem=500G
+#SBATCH --output=/home/wf287/scratch_pi_qc88/wf287/memory_r2/logs/slurm_%x_%j.out
+#SBATCH --partition=gpu_h200 --time=2-00:00:00
+#SBATCH --nodes=1 --ntasks=1 --gres=gpu:h200:2 --cpus-per-task=12 --mem=500G
 #SBATCH hetjob
-#SBATCH --partition=gpu --qos=qos_nmi --time=2-00:00:00
+#SBATCH --partition=gpu_h100 --time=2-00:00:00
 #SBATCH --nodes=1 --ntasks=1 --gres=gpu:h100:1 --cpus-per-task=8 --mem=160G
 #
 # Same training as train_memory.sbatch (defaults of _curriculum_learning.sh, paper 2/1/7 split,
@@ -33,4 +33,4 @@ POLICY_EXTRA_FLAGS="actor_rollout_ref.actor.fsdp_config.param_offload=True \
 actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
 actor_rollout_ref.ref.fsdp_config.param_offload=True"
 
-source /gpfs/radev/project/q_chen/wf287/memory_r2/scripts/train/train_memory_run.sh
+source /home/wf287/project_pi_qc88/wf287/memory_r2/scripts/train/train_memory_run.sh

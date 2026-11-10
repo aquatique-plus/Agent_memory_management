@@ -8,7 +8,7 @@
 #SBATCH --cpus-per-task=48
 #SBATCH --mem=800G
 #SBATCH --time=2-00:00:00
-#SBATCH --output=/gpfs/radev/home/wf287/scratch/memory_r2/logs/slurm_%x_%j.out
+#SBATCH --output=/home/wf287/scratch_pi_qc88/wf287/memory_r2/logs/slurm_%x_%j.out
 #
 # Same training as train_memory.sbatch on a single 4x H100 node: policy and the gpt-oss-120b answer
 # agent take turns on the same 4 GPUs (rema_trainer/answer_agent_timeshare.py).
@@ -32,4 +32,4 @@ POLICY_EXTRA_FLAGS="actor_rollout_ref.actor.fsdp_config.param_offload=True \
 actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
 actor_rollout_ref.ref.fsdp_config.param_offload=True"
 
-source /gpfs/radev/project/q_chen/wf287/memory_r2/scripts/train/train_memory_run.sh
+source /home/wf287/project_pi_qc88/wf287/memory_r2/scripts/train/train_memory_run.sh

@@ -9,12 +9,15 @@
 #   ANSWER_AGENT_TIMESHARE=1 instead runs gpt-oss on the policy GPUs of the batch step, started before each
 #   reward phase and stopped before each policy phase (rema_trainer/answer_agent_timeshare.py); then
 #   SERVER_NODE / SERVER_SRUN_ARGS are unused and SERVER_GPUS must equal N_POLICY_GPUS.
+#   ANSWER_AGENT_LOCAL=1 instead runs gpt-oss inside the batch step, on the last SERVER_GPUS of its GPUs;
+#   the policy gets the first N_POLICY_GPUS. Then SERVER_NODE / SERVER_SRUN_ARGS are unused.
 # Training config follows src/scripts/examples/_curriculum_learning.sh; see train_memory.sbatch.
 
 set -uo pipefail
 ANSWER_AGENT_TIMESHARE=${ANSWER_AGENT_TIMESHARE:-0}
+ANSWER_AGENT_LOCAL=${ANSWER_AGENT_LOCAL:-0}
 : "${SERVER_GPUS:?}" "${VLLM_TENSOR_PARALLEL:?}" "${N_POLICY_GPUS:?}"
-if [ "$ANSWER_AGENT_TIMESHARE" != "1" ]; then
+if [ "$ANSWER_AGENT_TIMESHARE" != "1" ] && [ "$ANSWER_AGENT_LOCAL" != "1" ]; then
     : "${SERVER_NODE:?}" "${SERVER_SRUN_ARGS:?}"
 fi
 POLICY_EXTRA_FLAGS=${POLICY_EXTRA_FLAGS:-}
@@ -29,11 +32,11 @@ AGG_MODE=${AGG_MODE:-turn}
 # test then loads the EMA saved with the best checkpoint.
 EMA_MOMENTUM=${EMA_MOMENTUM:-}
 
-TRAIN_SCRIPTS=/gpfs/radev/project/q_chen/wf287/memory_r2/scripts/train
-REPO=/gpfs/radev/project/q_chen/wf287/memory_r2/src
-SCRATCH=/gpfs/radev/home/wf287/scratch/memory_r2
+TRAIN_SCRIPTS=/home/wf287/project_pi_qc88/wf287/memory_r2/scripts/train
+REPO=/home/wf287/project_pi_qc88/wf287/memory_r2/src
+SCRATCH=/home/wf287/scratch_pi_qc88/wf287/memory_r2
 WORKSPACE=$SCRATCH/workspace
-GPFS_CONDA_ENV=/gpfs/radev/home/wf287/project/conda_envs/memory_r2
+GPFS_CONDA_ENV=/home/wf287/project_pi_qc88/wf287/conda-envs/memory_r2
 ENV_PACK=$SCRATCH/envpack/memory_r2.tar.zst   # tar of $GPFS_CONDA_ENV; rebuild after changing the env
 
 set -a; source "$REPO/.env" 2>/dev/null || true; set +a
@@ -67,6 +70,20 @@ if [ "$ANSWER_AGENT_TIMESHARE" = "1" ]; then
     # Keeps vLLM's compile caches across the per-step server restarts.
     export GPT_OSS_CACHE_DIR=$NODE_LOCAL_DIR/gpt_oss_cache
     SERVER_PID=""
+elif [ "$ANSWER_AGENT_LOCAL" = "1" ]; then
+    IFS=',' read -ra JOB_GPUS <<< "${CUDA_VISIBLE_DEVICES:?CUDA_VISIBLE_DEVICES not set}"
+    if [ "${#JOB_GPUS[@]}" -ne $((N_POLICY_GPUS + SERVER_GPUS)) ]; then
+        echo "[train] ERROR: local answer agent needs N_POLICY_GPUS + SERVER_GPUS = ${#JOB_GPUS[@]} job GPUs"
+        exit 1
+    fi
+    POLICY_GPU_LIST=$(IFS=','; echo "${JOB_GPUS[*]:0:$N_POLICY_GPUS}")
+    SERVER_GPU_LIST=$(IFS=','; echo "${JOB_GPUS[*]:$N_POLICY_GPUS}")
+    SERVER_NODE=127.0.0.1
+    echo "[train] job=$JOB_ID policy GPUs=$POLICY_GPU_LIST answer-agent GPUs=$SERVER_GPU_LIST (same node)"
+    CUDA_VISIBLE_DEVICES=$SERVER_GPU_LIST \
+        bash "$TRAIN_SCRIPTS/vllm_server_gpt_oss.sh" > "$LOG_DIR/gpt_oss_launcher.log" 2>&1 &
+    SERVER_PID=$!
+    export CUDA_VISIBLE_DEVICES=$POLICY_GPU_LIST
 else
     echo "[train] job=$JOB_ID policy GPUs=$N_POLICY_GPUS answer-agent node=$SERVER_NODE"
     srun $SERVER_SRUN_ARGS \
@@ -97,6 +114,26 @@ else
     echo "[train] WARNING: $ENV_PACK missing, importing from GPFS env $CONDA_ENV"
 fi
 export PATH="$CONDA_ENV/bin:$PATH"
+
+# Time-shared answer agent restarts every step: copy the frozen gpt-oss weights (HF format only, ~61GB;
+# original/ is skipped) to node-local disk once, so restarts don't re-read GPFS. Falls back to the HF cache.
+if [ "$ANSWER_AGENT_TIMESHARE" = "1" ]; then
+    GPT_OSS_SNAPSHOT=$(ls -d /home/wf287/scratch_pi_qc88/wf287/hf_cache/hub/models--${VLLM_JUDGE_MODEL//\//--}/snapshots/*/ | head -1)
+    GPT_OSS_LOCAL=$NODE_LOCAL_DIR/gpt_oss_model
+    need_kb=$(( $(du -sLk --exclude=original "$GPT_OSS_SNAPSHOT" | cut -f1) + 20 * 1024 * 1024 ))
+    free_kb=$(df -Pk "$NODE_LOCAL_DIR" | awk 'NR==2 {print $4}')
+    echo "[train] node-local disk: $(df -PhT "$NODE_LOCAL_DIR" | awk 'NR==2 {print $2, $5" free of "$3}')"
+    t0=$(date +%s)
+    if [ "$free_kb" -gt "$need_kb" ] && mkdir -p "$GPT_OSS_LOCAL" \
+        && rsync -aL --exclude=original/ "$GPT_OSS_SNAPSHOT" "$GPT_OSS_LOCAL/"; then
+        export GPT_OSS_MODEL_DIR=$GPT_OSS_LOCAL
+        echo "[train] copied gpt-oss weights to $GPT_OSS_LOCAL in $(( $(date +%s) - t0 ))s"
+    else
+        rm -rf "$GPT_OSS_LOCAL"
+        echo "[train] WARNING: could not copy gpt-oss weights to node-local disk (free ${free_kb}KB, need ${need_kb}KB), serving from GPFS"
+    fi
+fi
+
 export VLLM_CACHE_ROOT=$NODE_LOCAL_DIR/vllm_cache
 export TORCHINDUCTOR_CACHE_DIR=$NODE_LOCAL_DIR/inductor_cache
 export XDG_CACHE_HOME=$NODE_LOCAL_DIR/xdg_cache
@@ -106,7 +143,7 @@ export DATASET_DIR=$SCRATCH/data/locomo/processed_train_$JOB_ID
 export TMPDIR=$NODE_LOCAL_DIR/tmp
 export RAY_TMPDIR=/tmp/$USER/ray_$JOB_ID
 export SCRATCH_DIR=$WORKSPACE/verl_$JOB_ID
-export HF_HOME=/gpfs/radev/home/wf287/scratch/hf_cache
+export HF_HOME=/home/wf287/scratch_pi_qc88/wf287/hf_cache
 export HF_DATASETS_CACHE=$WORKSPACE/hf_datasets
 export TRITON_HOME=$NODE_LOCAL_DIR/trition
 export TRITON_DUMP_DIR=$NODE_LOCAL_DIR/trition_dump
@@ -174,8 +211,12 @@ export ANSWER_AGENT_MAX_PROMPT_TOKENS=${ANSWER_AGENT_MAX_PROMPT_TOKENS:-12288}
 # 4) Training (flags as in _curriculum_learning.sh)
 # ---------------------------------------------------------------------------
 export PROJECT_NAME="rema-curriculum-v1"
+# Checkpoints go to scratch (the project dir hit its quota). One subdir per experiment.
+export CKPT_DIR=${CKPT_DIR:-/home/wf287/scratch_pi_qc88/wf287/memory_r2/checkpoints}
 export BASE_MODEL="Qwen/Qwen2.5-7B-Instruct"
-CURRENT_MODEL_PATH=$BASE_MODEL
+# Set INIT_MODEL_PATH (an HF dir, e.g. a stage's global_step_N/hf_fixed) to start from a trained checkpoint;
+# the reference policy follows actor_rollout_ref.model.path, so KL is taken against it too.
+CURRENT_MODEL_PATH=${INIT_MODEL_PATH:-$BASE_MODEL}
 
 MAX_NUM_TURNS=4
 NUM_TRAIN_CONVS=2
@@ -310,6 +351,7 @@ for STAGE_SESSIONS in "${STAGES[@]}"; do
         +trainer.delete_bonus=0 \
         "${COMMON_FLAGS[@]}" \
         trainer.experiment_name=$STAGE_EXP_NAME \
+        trainer.default_local_dir=$CKPT_DIR/$STAGE_EXP_NAME \
         +trainer.max_sessions=$STAGE_SESSIONS \
         actor_rollout_ref.rollout.val_kwargs.n=2 \
         +trainer.test_only=False \
@@ -317,7 +359,7 @@ for STAGE_SESSIONS in "${STAGES[@]}"; do
         hydra.run.dir=$HYDRA_RUN_DIR 2>&1 | tee "$LOG_DIR/${STAGE_EXP_NAME}.log"
 
     # Warm-start the next stage from this stage's best-on-val checkpoint.
-    CHECKPOINT_ROOT="./checkpoints/$PROJECT_NAME/$STAGE_EXP_NAME"
+    CHECKPOINT_ROOT="$CKPT_DIR/$STAGE_EXP_NAME"
     ITER_FILE="$CHECKPOINT_ROOT/best_checkpoint_info.txt"
     if [ ! -f "$ITER_FILE" ]; then
         echo "[train] ERROR: no $ITER_FILE for stage $STAGE_SESSIONS"
@@ -331,7 +373,7 @@ for STAGE_SESSIONS in "${STAGES[@]}"; do
         --huggingface_model_path "$SHARDED_PATH/huggingface" \
         --output_path "$CONSOLIDATED_PATH" \
         --world_size $N_POLICY_GPUS || { echo "[train] ERROR: FSDP->HF conversion failed"; exit 1; }
-    CURRENT_MODEL_PATH=$REPO/${CONSOLIDATED_PATH#./}
+    CURRENT_MODEL_PATH=$CONSOLIDATED_PATH
     echo "[train] stage $STAGE_SESSIONS complete (best step $BEST_STEP). Next model: $CURRENT_MODEL_PATH"
 done
 
@@ -349,10 +391,11 @@ mkdir -p "$HYDRA_RUN_DIR"
 PYTHONUNBUFFERED=1 python -m verl.rema_trainer.main_ppo \
     "${COMMON_FLAGS[@]}" \
     trainer.experiment_name=$TEST_EXP_NAME \
+    trainer.default_local_dir=$CKPT_DIR/$TEST_EXP_NAME \
     +trainer.max_sessions=32 \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     +trainer.test_only=True \
-    ${EMA_MOMENTUM:++actor_rollout_ref.ema_init_path=$REPO/${SHARDED_PATH#./}} \
+    ${EMA_MOMENTUM:++actor_rollout_ref.ema_init_path=$SHARDED_PATH} \
     hydra.run.dir=$HYDRA_RUN_DIR 2>&1 | tee "$LOG_DIR/${TEST_EXP_NAME}.log"
 
 echo "[train] ALL STAGES AND FINAL TEST COMPLETE"

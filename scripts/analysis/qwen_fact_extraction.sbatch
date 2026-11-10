@@ -8,7 +8,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=00:45:00
-#SBATCH --output=/gpfs/radev/home/wf287/scratch/memory_r2/logs/slurm_%x_%j.out
+#SBATCH --output=/home/wf287/scratch_pi_qc88/wf287/memory_r2/logs/slurm_%x_%j.out
 #
 # Fact extraction on the gold evidence turns of wrong LoCoMo QAs with official Qwen2.5-7B-Instruct,
 # using the Memory-R2 extractor prompt. Writes <name>.{jsonl,md} into analysis/wrong_qa/.
@@ -24,9 +24,9 @@
 
 set -euo pipefail
 
-ROOT=/gpfs/radev/home/wf287/project/memory_r2
-SCRATCH=/gpfs/radev/home/wf287/scratch/memory_r2
-GPFS_CONDA_ENV=/gpfs/radev/home/wf287/project/conda_envs/memory_r2
+ROOT=/home/wf287/project_pi_qc88/wf287/memory_r2
+SCRATCH=/home/wf287/scratch_pi_qc88/wf287/memory_r2
+GPFS_CONDA_ENV=/home/wf287/project_pi_qc88/wf287/conda-envs/memory_r2
 ENV_PACK=$SCRATCH/envpack/memory_r2.tar.zst
 mkdir -p "$SCRATCH/logs"
 
@@ -47,7 +47,7 @@ fi
 export VLLM_CACHE_ROOT=$NODE_LOCAL_DIR/vllm_cache
 export TORCHINDUCTOR_CACHE_DIR=$NODE_LOCAL_DIR/inductor_cache
 export XDG_CACHE_HOME=$NODE_LOCAL_DIR/xdg_cache
-export HF_HOME=/gpfs/radev/home/wf287/scratch/hf_cache
+export HF_HOME=/home/wf287/scratch_pi_qc88/wf287/hf_cache
 export HF_HUB_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
 

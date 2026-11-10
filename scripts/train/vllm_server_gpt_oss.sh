@@ -8,7 +8,7 @@
 #
 # TP=2 by default: the ~65GB MXFP4 weights fit on one H100 at TP=1, but leave only a few GB of KV cache.
 
-SCRATCH=/gpfs/radev/home/wf287/scratch/memory_r2
+SCRATCH=/home/wf287/scratch_pi_qc88/wf287/memory_r2
 SIF_PATH=${SIF_PATH:-$SCRATCH/images/vllm-openai_v0.11.0.sif}
 TIKTOKEN_DIR=$SCRATCH/tiktoken_encodings
 
@@ -22,8 +22,8 @@ VLLM_MAX_NUM_SEQS=${VLLM_MAX_NUM_SEQS:-512}
 VLLM_BASE_PORT=${VLLM_BASE_PORT:?Set VLLM_BASE_PORT}
 SERVER_LOG_DIR=${SERVER_LOG_DIR:?Set SERVER_LOG_DIR}
 
-set -a; source /gpfs/radev/project/q_chen/wf287/memory_r2/src/.env 2>/dev/null || true; set +a
-export HF_HOME=/gpfs/radev/home/wf287/scratch/hf_cache
+set -a; source /home/wf287/project_pi_qc88/wf287/memory_r2/src/.env 2>/dev/null || true; set +a
+export HF_HOME=/home/wf287/scratch_pi_qc88/wf287/hf_cache
 export HF_TOKEN="${HF_TOKEN:?Set HF_TOKEN via env or sourced .env file}"
 unset ROCR_VISIBLE_DEVICES
 
@@ -42,6 +42,16 @@ else
     trap 'kill $(jobs -p) 2>/dev/null; rm -rf "$NODE_LOCAL_DIR"' EXIT
 fi
 mkdir -p "$NODE_LOCAL_DIR" "$SERVER_LOG_DIR"
+
+# GPT_OSS_MODEL_DIR: node-local copy of the weights (set by train_memory_run.sh in timeshare mode);
+# the served model name stays $VLLM_JUDGE_MODEL either way.
+MODEL_ARG=$VLLM_JUDGE_MODEL
+MODEL_BIND=()
+if [ -n "${GPT_OSS_MODEL_DIR:-}" ]; then
+    MODEL_ARG=$GPT_OSS_MODEL_DIR
+    MODEL_BIND=(--bind "$GPT_OSS_MODEL_DIR":"$GPT_OSS_MODEL_DIR")
+fi
+echo "[gpt-oss] model weights: $MODEL_ARG"
 
 IFS=',' read -ra GPUS <<< "${CUDA_VISIBLE_DEVICES:?CUDA_VISIBLE_DEVICES not set}"
 NUM_SERVERS=$(( ${#GPUS[@]} / VLLM_TENSOR_PARALLEL ))
@@ -63,8 +73,9 @@ for ((i = 0; i < NUM_SERVERS; i++)); do
         --bind "$HF_HOME":"$HF_HOME" \
         --bind "$TIKTOKEN_DIR":"$TIKTOKEN_DIR" \
         --bind "$NODE_LOCAL_DIR":"$NODE_LOCAL_DIR" \
+        "${MODEL_BIND[@]}" \
         "$SIF_PATH" \
-        --model "$VLLM_JUDGE_MODEL" \
+        --model "$MODEL_ARG" \
         --served-model-name "$VLLM_JUDGE_MODEL" \
         --host 0.0.0.0 \
         --port "$PORT" \

@@ -1938,7 +1938,11 @@ class RayReMATrainer(object):
             assert self.config.actor_rollout_ref.rollout.get('insert_only', False), (
                 "unretrieved_fact_weight needs rollout.insert_only: memory entries must be the facts themselves")
             unretrieved_fact_weight = float(unretrieved_fact_weight)
-        
+        if self.config.actor_rollout_ref.rollout.get('freeze_fact_extractor', False):
+            assert float(self.config.actor_rollout_ref.get('ema_momentum', None) or 0) == 1.0, (
+                "freeze_fact_extractor needs actor_rollout_ref.ema_momentum=1.0: the extractor must generate "
+                "with its own frozen copy of the initial weights")
+
         # Best validation tracking
         self.best_val_acc = -1.0
         self.best_global_step = -1
@@ -2782,9 +2786,13 @@ class RayReMATrainer(object):
                         
                         # Fix for DP chunking error: Ensure the final batch size (after role expansion) is perfectly 
                         # divisible by world_size by dropping dangling inner samples at the very end of the batch.
-                        # insert_only keeps only the fact-extractor rows (see merge below), so one row per sample.
+                        # insert_only keeps only the fact-extractor rows and freeze_fact_extractor only the
+                        # executor rows (see merge below), so one row per sample.
                         insert_only = self.config.actor_rollout_ref.rollout.get('insert_only', False)
-                        trained_roles = 1 if insert_only else len(agent_roles)
+                        freeze_fact_extractor = self.config.actor_rollout_ref.rollout.get('freeze_fact_extractor', False)
+                        assert not (insert_only and freeze_fact_extractor), (
+                            "insert_only and freeze_fact_extractor would leave no role to train")
+                        trained_roles = 1 if (insert_only or freeze_fact_extractor) else len(agent_roles)
                         target_bsz_before_roles = len(batch.batch)
                         while (target_bsz_before_roles * trained_roles) % self.actor_rollout_wg.world_size != 0:
                             target_bsz_before_roles -= 1
@@ -2809,6 +2817,14 @@ class RayReMATrainer(object):
                             import copy
                             meta_info = copy.deepcopy(merged_batch.meta_info)
                             merged_batch = merged_batch[:len(batch.batch)]
+                            merged_batch.meta_info = meta_info
+                        elif self.config.actor_rollout_ref.rollout.get('freeze_fact_extractor', False):
+                            # Fact-extractor rows (first half, agent_roles[0]) get no gradient; pair with
+                            # actor_rollout_ref.ema_momentum=1.0 so the extractor also generates with the
+                            # initial weights rather than the executor-updated ones.
+                            import copy
+                            meta_info = copy.deepcopy(merged_batch.meta_info)
+                            merged_batch = merged_batch[len(batch.batch):]
                             merged_batch.meta_info = meta_info
 
                         # Recalculate global_token_num for the entire merged mega-batch

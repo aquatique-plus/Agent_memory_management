@@ -8,7 +8,7 @@
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=400G
 #SBATCH --time=04:00:00
-#SBATCH --output=/gpfs/radev/home/wf287/scratch/memory_r2/logs/slurm_%x_%j.out
+#SBATCH --output=/home/wf287/scratch_pi_qc88/wf287/memory_r2/logs/slurm_%x_%j.out
 #
 # Answer-agent GRPO, step 3/3 — paper recipe for ahmedehabb/Memory-R2-answer-agent (sft_cont_step55):
 #   STAGE=1  Qwen2.5-7B-Instruct, 5 epochs on the F1>=0.15 gpt-4o trace split
@@ -35,12 +35,12 @@
 
 set -euo pipefail
 
-REPO=/gpfs/radev/project/q_chen/wf287/memory_r2/src
-SCRATCH=/gpfs/radev/home/wf287/scratch/memory_r2
+REPO=/home/wf287/project_pi_qc88/wf287/memory_r2/src
+SCRATCH=/home/wf287/scratch_pi_qc88/wf287/memory_r2
 CKPT_ROOT=$SCRATCH/checkpoints/answer_agent_grpo
 STAGE=${STAGE:?STAGE=1|2 required}
 
-GPFS_CONDA_ENV=/gpfs/radev/home/wf287/project/conda_envs/memory_r2
+GPFS_CONDA_ENV=/home/wf287/project_pi_qc88/wf287/conda-envs/memory_r2
 ENV_PACK=$SCRATCH/envpack/memory_r2.tar.zst   # tar of $GPFS_CONDA_ENV; rebuild after changing the env
 
 # Node-local env + caches, same as eval_locomo.sbatch: importing torch/vllm/verl from the 72k-file
@@ -70,7 +70,7 @@ mkdir -p "$VLLM_CACHE_ROOT" "$TORCHINDUCTOR_CACHE_DIR" "$XDG_CACHE_HOME"
 cp -r "$HOME/.cache/vllm/." "$VLLM_CACHE_ROOT/" 2>/dev/null || true
 
 set -a; source "$REPO/.env"; set +a
-export HF_HOME=/gpfs/radev/home/wf287/scratch/hf_cache
+export HF_HOME=/home/wf287/scratch_pi_qc88/wf287/hf_cache
 export RAY_TMPDIR=/tmp/ray_$SLURM_JOB_ID
 mkdir -p "$RAY_TMPDIR" "$CKPT_ROOT"
 

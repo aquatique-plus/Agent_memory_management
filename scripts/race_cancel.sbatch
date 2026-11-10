@@ -4,7 +4,7 @@
 #SBATCH --time=24:00:00
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=1G
-#SBATCH --output=/gpfs/radev/home/wf287/scratch/memory_r2/logs/slurm_%x_%j.out
+#SBATCH --output=/home/wf287/scratch_pi_qc88/wf287/memory_r2/logs/slurm_%x_%j.out
 #
 # Watch two queued jobs; once one has been RUNNING for MIN_RUN seconds (or COMPLETED), scancel the
 # other and exit. A job that dies before that (startup crash, OOM in the first steps) does not count:

@@ -8,7 +8,7 @@
 #SBATCH --cpus-per-task=48
 #SBATCH --mem=800G
 #SBATCH --time=2-00:00:00
-#SBATCH --output=/gpfs/radev/home/wf287/scratch/memory_r2/logs/slurm_%x_%j.out
+#SBATCH --output=/home/wf287/scratch_pi_qc88/wf287/memory_r2/logs/slurm_%x_%j.out
 #
 # Memory-management (Extractor + Manager) LoGo-GRPO training with the defaults of
 # src/scripts/examples/_curriculum_learning.sh, the README's training entry point:
@@ -40,4 +40,4 @@ VLLM_TENSOR_PARALLEL=${VLLM_TENSOR_PARALLEL:-2}
 N_POLICY_GPUS=4
 POLICY_EXTRA_FLAGS=""
 
-source /gpfs/radev/project/q_chen/wf287/memory_r2/scripts/train/train_memory_run.sh
+source /home/wf287/project_pi_qc88/wf287/memory_r2/scripts/train/train_memory_run.sh

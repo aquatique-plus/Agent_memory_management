@@ -3,7 +3,6 @@ import os
 import json
 import hashlib
 import threading
-import google.generativeai as genai
 from together import Together
 from filelock import FileLock
 from typing import List
@@ -53,6 +52,8 @@ else:
 # Initialize clients based on selected provider
 if JUDGE_PROVIDER == "gemini":
     print("[judge_llm] Using Gemini API")
+    # Imported only here: the training env has google-genai (teacher_model.py), not the legacy google-generativeai SDK.
+    import google.generativeai as genai
     genai.configure(api_key=os.environ["GEMINI_API_KEY"])
     gemini_model = genai.GenerativeModel(GEMINI_JUDGE_MODEL)
     together_clients = None

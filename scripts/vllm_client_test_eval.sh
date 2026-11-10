@@ -192,7 +192,7 @@ fi
 # Set REMA_DUMP_MEMOPS=1; REMA_MEMOPS_SPLITS limits splits (default: all).
 if [ -n "${REMA_DUMP_MEMOPS:-}" ]; then
   export REMA_DUMP_MEMOPS
-  export REMA_QA_DUMP_DIR=${REMA_QA_DUMP_DIR:-/gpfs/radev/home/wf287/scratch/memory_r2/qa_dumps}
+  export REMA_QA_DUMP_DIR=${REMA_QA_DUMP_DIR:-/home/wf287/scratch_pi_qc88/wf287/memory_r2/qa_dumps}
   export REMA_RUN_NAME=${REMA_RUN_NAME:-${RUN_TAG}_${RUN_TS}}
   [ -n "${REMA_MEMOPS_SPLITS:-}" ] && export REMA_MEMOPS_SPLITS
   echo "[test-eval] memory-op log enabled: $REMA_QA_DUMP_DIR/$REMA_RUN_NAME/memory_ops/"

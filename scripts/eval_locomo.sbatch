@@ -5,7 +5,7 @@
 #SBATCH --gres=gpu:h200:3
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=24
+#SBATCH --cpus-per-task=18   # gpu_h200 caps at 6 CPUs per GPU
 #SBATCH --mem=400G
 #SBATCH --time=03:00:00
 #SBATCH --output=/nfs/roberts/scratch/pi_qc88/wf287/memory_r2/logs/slurm_%x_%j.out
@@ -102,9 +102,23 @@ cp -r "$HOME/.cache/vllm/." "$VLLM_CACHE_ROOT/" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # 1) Answer agent on GPU 0
+#    gpt-oss needs the vLLM 0.11 apptainer image (the env's vLLM 0.8.5 can't serve it), so it goes
+#    through the training launcher (TP=1: the ~65GB MXFP4 weights leave plenty of KV cache on an H200);
+#    that launcher writes no rendezvous file, so we write it here.
 # ---------------------------------------------------------------------------
-CUDA_VISIBLE_DEVICES=$AA_GPU HF_HUB_OFFLINE=${ANSWER_AGENT_HF_OFFLINE:-0} bash "$SCRIPTS/vllm_server_answer_agent.sh" \
-    > "$SCRATCH/logs/answer_agent_$SLURM_JOB_ID.log" 2>&1 &
+if [[ "$ANSWER_AGENT_MODEL" == *gpt-oss* ]]; then
+    echo "$(hostname):${VLLM_PORT}" > "$RENDEZVOUS_DIR/server_0.txt"
+    CUDA_VISIBLE_DEVICES=$AA_GPU VLLM_JUDGE_MODEL=$ANSWER_AGENT_MODEL VLLM_TENSOR_PARALLEL=1 \
+        VLLM_BASE_PORT=$VLLM_PORT SERVER_LOG_DIR=$SCRATCH/logs/answer_agent_$SLURM_JOB_ID \
+        bash "$SCRIPTS/train/vllm_server_gpt_oss.sh" \
+        > "$SCRATCH/logs/answer_agent_$SLURM_JOB_ID.log" 2>&1 &
+    # Same caps as training (train_memory_run.sh): gpt-oss reasons before answering.
+    export ANSWER_AGENT_MAX_TOKENS=${ANSWER_AGENT_MAX_TOKENS:-4096}
+    export ANSWER_AGENT_MAX_PROMPT_TOKENS=${ANSWER_AGENT_MAX_PROMPT_TOKENS:-12288}
+else
+    CUDA_VISIBLE_DEVICES=$AA_GPU HF_HUB_OFFLINE=${ANSWER_AGENT_HF_OFFLINE:-0} bash "$SCRIPTS/vllm_server_answer_agent.sh" \
+        > "$SCRATCH/logs/answer_agent_$SLURM_JOB_ID.log" 2>&1 &
+fi
 AA_PID=$!
 cleanup() {
     pkill -P "$AA_PID" 2>/dev/null   # vllm + tee first, before they get reparented
@@ -130,7 +144,7 @@ if [ -n "${MAX_OUTPUT_TOKENS:-}" ]; then
     export MAX_RESPONSE_LENGTH_OVERRIDE=$MAX_OUTPUT_TOKENS
     export ANSWER_AGENT_MAX_TOKENS=$MAX_OUTPUT_TOKENS
 else
-    export ANSWER_AGENT_MAX_TOKENS=0   # 0 = no max_tokens, as upstream
+    export ANSWER_AGENT_MAX_TOKENS=${ANSWER_AGENT_MAX_TOKENS:-0}   # 0 = no max_tokens, as upstream
 fi
 export ANSWER_AGENT_MAX_PROMPT_TOKENS=${ANSWER_AGENT_MAX_PROMPT_TOKENS:-0}   # 0 = no prompt truncation, as upstream
 
@@ -162,8 +176,9 @@ if [ -d "$DUMP_ROOT" ]; then
     JUDGE_FLAG=""
     if [ "${LLM_JUDGE:-0}" = "1" ]; then
         JUDGE_FLAG="--llm_judge"
-        # Judge key/model come from LLM_JUDGE_* in .env, never from the embedding OPENAI_API_KEY.
+        # Judge key/model come from LLM_JUDGE_* in .env; JUDGE_MODEL (env) overrides .env's LLM_JUDGE_MODEL.
         set -a; source "$REPO/.env" 2>/dev/null || true; set +a
+        [ -n "${JUDGE_MODEL:-}" ] && export LLM_JUDGE_MODEL=$JUDGE_MODEL
     fi
     "$CONDA_ENV/bin/python" "$REPO/testing/pipeline_test_locomo_qa_dump/score_locomo_qa_dumps.py" \
         --dump_root "$DUMP_ROOT" \
@@ -180,6 +195,22 @@ if [ -d "$MEMOPS_DIR" ]; then
 import sys, json, collections
 c = collections.Counter((d["op"], d["status"]) for d in map(json.loads, sys.stdin))
 for (op, st), n in sorted(c.items()): print(f"  {op:12s} {st:8s} {n}")'
+fi
+
+# Memory-bank snapshots (one per chunk; highest chunk = final bank) live in the workspace cache;
+# copy the human-readable JSONs next to the QA dump / memory ops.
+BANK_SRC=$SCRATCH/workspace/memory/memory_cache_${SLURM_JOB_ID}_$(echo "$RUN_TAG" | tr -cs '[:alnum:]_-' '_')/test
+BANK_DST=$REMA_QA_DUMP_DIR/${RUN_TAG}_${RUN_TS}/memory_bank
+if [ -d "$BANK_SRC" ]; then
+    mkdir -p "$BANK_DST"
+    (cd "$BANK_SRC" && find . -name '*.json' -print0 | cpio -0pdm --quiet "$BANK_DST")
+    for conv in "$BANK_DST"/epoch_*/conv-*; do
+        last=$(ls "$conv" | grep -E '^chunk_[0-9]+_idx_0\.json$' | sort -V | tail -1)
+        [ -n "$last" ] && mkdir -p "$BANK_DST/final" && cp "$conv/$last" "$BANK_DST/final/$(basename "$conv").json"
+    done
+    echo "[eval] memory bank snapshots -> $BANK_DST (final banks in $BANK_DST/final/)"
+else
+    echo "[eval] WARNING: no memory-bank snapshots at $BANK_SRC"
 fi
 
 exit "$EVAL_RC"

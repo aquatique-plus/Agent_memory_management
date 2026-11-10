@@ -1,13 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=memr2_8s_insdrg
-#SBATCH --output=/gpfs/radev/home/wf287/scratch/memory_r2/logs/slurm_%x_%j.out
-#SBATCH --partition=gpu --qos=qos_nmi --time=05:00:00
-#SBATCH --nodes=1 --ntasks=1 --gres=gpu:h200:2 --cpus-per-task=24 --mem=500G
-#SBATCH hetjob
-#SBATCH --partition=gpu --qos=qos_nmi --time=05:00:00
-#SBATCH --nodes=1 --ntasks=1 --gres=gpu:h100:1 --cpus-per-task=8 --mem=160G
+#SBATCH --output=/home/wf287/scratch_pi_qc88/wf287/memory_r2/logs/slurm_%x_%j.out
+#SBATCH --partition=gpu_h200 --time=05:00:00
+#SBATCH --nodes=1 --ntasks=1 --gres=gpu:h200:3 --cpus-per-task=18 --mem=660G
 #
-# 8-session ablation, 10 epochs, 2x H200 policy + 1x H100 gpt-oss (see train_memory_h200x2_h100x1.sbatch).
+# 8-session ablation, 10 epochs, 3x H200 on one node: 2 policy + 1 gpt-oss (see train_memory_h200x3.sbatch).
 # Scheme 1: every memory op is an INSERT of an extracted fact; only fact-extractor rows get gradients.
 # Dr. GRPO variant: advantage = reward - group mean (no std division); token-level ratio/clip, loss = token sum
 # per response over a fixed 2048 (no division by response length).
@@ -16,4 +13,4 @@
 
 export STAGES_OVERRIDE=8 NUM_EPOCHS=10 DATA_SEED=2843377488 COMPRESSION_PENALTY=0.3
 export EXTRA_FLAGS="+actor_rollout_ref.rollout.insert_only=True +algorithm.norm_adv_by_std_in_grpo=False +actor_rollout_ref.actor.loss_scale_factor=2048" EXP_TAG=insertonly_drgrpo CLIP_MODE=token AGG_MODE=seq-sum-norm
-source /gpfs/radev/project/q_chen/wf287/memory_r2/scripts/train/train_memory_h200x2_h100x1.sbatch
+source /home/wf287/project_pi_qc88/wf287/memory_r2/scripts/train/train_memory_h200x3.sbatch

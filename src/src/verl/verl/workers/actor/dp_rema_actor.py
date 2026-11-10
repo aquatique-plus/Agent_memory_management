@@ -185,7 +185,8 @@ class DataParallelReMAPPOActor(BasePPOActor):
         else:
             grad_norm = torch.nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.grad_clip)
         self.actor_optimizer.step()
-        if self.ema_params is not None:
+        # momentum 1.0 is a frozen copy (freeze_fact_extractor): the update would be a no-op pass over all weights.
+        if self.ema_params is not None and self.ema_momentum < 1.0:
             self._update_ema()
         return grad_norm
 
