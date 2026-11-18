@@ -218,7 +218,13 @@ export BASE_MODEL="Qwen/Qwen2.5-7B-Instruct"
 # the reference policy follows actor_rollout_ref.model.path, so KL is taken against it too.
 CURRENT_MODEL_PATH=${INIT_MODEL_PATH:-$BASE_MODEL}
 
-MAX_NUM_TURNS=4
+# Rollout turns per session; with SEGMENTS_FILE (surprisal segments) it caps the segments per session.
+MAX_NUM_TURNS=${MAX_NUM_TURNS:-4}
+# segments.json from data/locomo/compute_surprisal.py: adds segment_bounds_json to the parquet files
+# (pair with +actor_rollout_ref.rollout.use_segment_bounds=True in EXTRA_FLAGS).
+SEGMENTS_FILE=${SEGMENTS_FILE:-}
+# 1 = skip the in-job final test (run scripts/eval_locomo.sbatch with CKPT_EXP_DIR afterwards instead).
+SKIP_FINAL_TEST=${SKIP_FINAL_TEST:-0}
 NUM_TRAIN_CONVS=2
 NUM_VAL_CONVS=1
 NUM_TEST_CONVS=7
@@ -332,7 +338,7 @@ set_common_flags() {
 preprocess() {
     python data/locomo/data_preprocess.py --max_sessions "$1" \
         --train_convs $NUM_TRAIN_CONVS --val_convs $NUM_VAL_CONVS --test_convs $NUM_TEST_CONVS \
-        --seed $DATA_SEED --output_dir "$DATASET_DIR"
+        --seed $DATA_SEED --output_dir "$DATASET_DIR" ${SEGMENTS_FILE:+--segments_file "$SEGMENTS_FILE"}
 }
 
 for STAGE_SESSIONS in "${STAGES[@]}"; do
@@ -380,6 +386,10 @@ done
 # ---------------------------------------------------------------------------
 # 5) Final test of the best last-stage model on all 32 sessions
 # ---------------------------------------------------------------------------
+if [ "$SKIP_FINAL_TEST" = "1" ]; then
+    echo "[train] SKIP_FINAL_TEST=1: best model $CURRENT_MODEL_PATH (eval with scripts/eval_locomo.sbatch)"
+    exit 0
+fi
 echo "[train] STARTING FINAL TEST ON 32 SESSIONS"
 preprocess 32 || { echo "[train] ERROR: preprocessing failed"; exit 1; }
 set_common_flags

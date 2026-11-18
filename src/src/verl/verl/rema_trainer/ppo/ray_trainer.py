@@ -454,6 +454,35 @@ def compute_token_level_scores(data: DataProto, dtype=torch.float32)->torch.Tens
     return token_level_scores
 
 
+_GEN_NON_TENSOR_KEYS = ['sample_id', 'chunk_id', 'speakers', 'qa_pairs_json', 'num_qas', 'turns_json', 'session_id',
+                        'session_time', 'session_evidences_json', 'cumulative_session_tokens']
+
+
+def _gen_non_tensor_keys(batch) -> list:
+    """Non-tensor columns handed to the rollout; segment_bounds_json only exists with surprisal segments."""
+    extra = ['segment_bounds_json'] if 'segment_bounds_json' in batch.non_tensor_batch else []
+    return _GEN_NON_TENSOR_KEYS + extra
+
+
+def compute_truncation_metrics(gen_output, prefix: str) -> dict:
+    """Per-role truncation rates of one rollout batch (fields set by vllm_rollout_spmd)."""
+    nt = gen_output.non_tensor_batch
+    if 'trunc_role' not in nt:
+        return {}
+    roles = list(nt['trunc_role'])
+    n = max(len(roles), 1)
+    out = {f'{prefix}/{r}': sum(x == r for x in roles) / n
+           for r in ('fact_state', 'memory_state', 'fact_response', 'memory_response')}
+    for role, name in (('meta_thinking', 'fact'), ('reasoning', 'memory')):
+        key = f'{role}_num_prompt_tokens'
+        if key in gen_output.batch.keys():
+            out[f'{prefix}/{name}_max_state_tokens'] = gen_output.batch[key].max().item()
+        key = f'{role}_num_gen_tokens'
+        if key in gen_output.batch.keys():
+            out[f'{prefix}/{name}_max_gen_tokens'] = gen_output.batch[key].max().item()
+    return out
+
+
 def merge_roles_data(data: DataProto) -> DataProto:
     """
     Merge data from different roles into a single DataProto.
@@ -993,6 +1022,7 @@ class RayReMATrainer(object):
         # print("="*80)
         
         num_turns_lst = []
+        trunc_lst = []
         history_lst = []
         sample_groundtruths = []
         completion_tokens_lst = []
@@ -1096,7 +1126,7 @@ class RayReMATrainer(object):
             else:
                 test_gen_batch = test_batch.select(
                         batch_keys=['rollout_idx', 'batch_idx', 'epoch'], 
-                        non_tensor_batch_keys=['sample_id', 'chunk_id', 'speakers', 'qa_pairs_json', 'num_qas', 'turns_json', 'session_id', 'session_time', 'session_evidences_json', 'cumulative_session_tokens'], 
+                        non_tensor_batch_keys=_gen_non_tensor_keys(test_batch), 
                         meta_info_keys=['agent_roles', 'finish_flag', 'system_prompts', 'max_num_turns', 'split'], 
                         deepcopy=True
                     )
@@ -1127,6 +1157,7 @@ class RayReMATrainer(object):
             # unpad
             # print(f"[VAL BATCH {batch_idx + 1}] Unpadding batch...")
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+            trunc_lst.append(compute_truncation_metrics(test_output_gen_batch, 'val/trunc'))
             # print(f'[VAL BATCH {batch_idx + 1}] Validation generation end. Output batch size: {len(test_output_gen_batch.batch)}')
 
             # (Generated outputs and history will be collected only for finished conversations)
@@ -1317,6 +1348,10 @@ class RayReMATrainer(object):
 
         # print(f"\n[VALIDATE] Validation complete. Final metrics: {metric_dict}")
         # print("="*80 + "\n")
+        for _k in sorted({k for d in trunc_lst for k in d}):
+            _v = [d[_k] for d in trunc_lst if _k in d]
+            metric_dict[_k] = max(_v) if _k.endswith('_tokens') else float(np.mean(_v))
+        print(f"[TRUNC val] " + " ".join(f"{k}={metric_dict[k]:.4g}" for k in sorted(metric_dict) if '/trunc/' in k))
         return metric_dict
 
     def _test(self):
@@ -1337,6 +1372,7 @@ class RayReMATrainer(object):
         bleu_tensor_lst = []
         data_source_lst = []
         num_turns_lst = []
+        trunc_lst = []
         completion_tokens_lst = []
         input_tokens_lst = []            # per-trajectory input/context tokens (sum over turns, both roles)
         mt_gen_lst = []; rs_gen_lst = []   # per-role output tokens (extractor=meta_thinking, manager=reasoning)
@@ -1431,7 +1467,7 @@ class RayReMATrainer(object):
             else:
                 test_gen_batch = test_batch.select(
                         batch_keys=['rollout_idx', 'batch_idx', 'epoch'], 
-                        non_tensor_batch_keys=['sample_id', 'chunk_id', 'speakers', 'qa_pairs_json', 'num_qas', 'turns_json', 'session_id', 'session_time', 'session_evidences_json', 'cumulative_session_tokens'], 
+                        non_tensor_batch_keys=_gen_non_tensor_keys(test_batch), 
                         meta_info_keys=['agent_roles', 'finish_flag', 'system_prompts', 'max_num_turns', 'split'], 
                         deepcopy=True
                     )
@@ -1461,6 +1497,7 @@ class RayReMATrainer(object):
             # unpad
             # print(f"[TEST BATCH {batch_idx + 1}] Unpadding batch...")
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+            trunc_lst.append(compute_truncation_metrics(test_output_gen_batch, 'test/trunc'))
             # print(f'[TEST BATCH {batch_idx + 1}] Test generation end. Output batch size: {len(test_output_gen_batch.batch)}')
 
             # (Generated outputs and history will be collected only for finished conversations)
@@ -1708,6 +1745,10 @@ class RayReMATrainer(object):
 
         # print(f"\n[TEST] Test complete. Final metrics: {metric_dict}")
         # print("="*80 + "\n")
+        for _k in sorted({k for d in trunc_lst for k in d}):
+            _v = [d[_k] for d in trunc_lst if _k in d]
+            metric_dict[_k] = max(_v) if _k.endswith('_tokens') else float(np.mean(_v))
+        print(f"[TRUNC test] " + " ".join(f"{k}={metric_dict[k]:.4g}" for k in sorted(metric_dict) if '/trunc/' in k))
         return metric_dict
 
     def init_workers(self):
@@ -2183,7 +2224,7 @@ class RayReMATrainer(object):
                     # because verl originally calls this 'chat'
                     gen_batch = new_batch.select(
                         batch_keys=['rollout_idx', 'batch_idx', 'epoch'], 
-                        non_tensor_batch_keys=['sample_id', 'chunk_id', 'speakers', 'qa_pairs_json', 'num_qas', 'turns_json', 'session_id', 'session_time', 'session_evidences_json', 'cumulative_session_tokens'], 
+                        non_tensor_batch_keys=_gen_non_tensor_keys(new_batch), 
                         meta_info_keys=['agent_roles', 'finish_flag', 'system_prompts', 'max_num_turns', 'split'],
                         deepcopy=True
                     )
@@ -2233,6 +2274,9 @@ class RayReMATrainer(object):
                     # print(f"\n[STEP {self.global_steps}] >>> Calling multi_turn_generate_sequences...")
                     with _timer('gen', timing_raw):
                         gen_batch_output = self.actor_rollout_wg.multi_turn_generate_sequences(gen_batch)
+                    trunc_metrics = compute_truncation_metrics(gen_batch_output, 'trunc')
+                    metrics.update(trunc_metrics)
+                    print(f"[TRUNC train step {self.global_steps}] " + " ".join(f"{k}={v:.4g}" for k, v in trunc_metrics.items()))
                     # print(f"[STEP {self.global_steps}] <<< Generation complete. Output batch size: {len(gen_batch_output.batch)}")
                     # print(f"[STEP {self.global_steps}] gen_batch_output.batch keys: {list(gen_batch_output.batch.keys())}")
                     # print(f"[STEP {self.global_steps}] gen_batch_output.non_tensor_batch keys: {list(gen_batch_output.non_tensor_batch.keys())}")
@@ -2375,7 +2419,7 @@ class RayReMATrainer(object):
                         # Create the subset generator batch exactly like standard gen_batch
                         inner_gen_batch = inner_batch_full.select(
                             batch_keys=['rollout_idx', 'source_rollout_idx', 'batch_idx', 'epoch'], 
-                            non_tensor_batch_keys=['sample_id', 'chunk_id', 'speakers', 'qa_pairs_json', 'num_qas', 'turns_json', 'session_id', 'session_time', 'session_evidences_json', 'cumulative_session_tokens'], 
+                            non_tensor_batch_keys=_gen_non_tensor_keys(inner_batch_full), 
                             meta_info_keys=['agent_roles', 'finish_flag', 'system_prompts', 'max_num_turns', 'split'],
                             deepcopy=True
                         )
@@ -2399,6 +2443,7 @@ class RayReMATrainer(object):
                         with _timer('gen_inner', timing_raw):
                             inner_output_padded = self.actor_rollout_wg.multi_turn_generate_sequences(inner_gen_batch_padded)
                         inner_output = unpad_dataproto(inner_output_padded, pad_size=pad_size)
+                        metrics.update(compute_truncation_metrics(inner_output, 'trunc_inner'))
                         inner_output.meta_info = deepcopy(inner_output.meta_info)
 
                         # Pop generation-specific keys from both metainfos to prevent union conflicts

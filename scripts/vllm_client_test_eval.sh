@@ -144,7 +144,7 @@ echo "[test-eval] Model: $MODEL_PATH"
 echo "[test-eval] RUN_TAG: $RUN_TAG"
 
 # Use pre-processed data (max_sessions=32, all 7 test convs)
-DATASET_DIR=/nfs/roberts/scratch/pi_qc88/wf287/memory_r2/data/locomo/processed
+DATASET_DIR=${DATASET_DIR_OVERRIDE:-/nfs/roberts/scratch/pi_qc88/wf287/memory_r2/data/locomo/processed}
 NUM_TEST_CONVS=7    # 7 held-out test convs (conv-41,49,50,42,48,30,26); conv-47 reserved for train
 NUM_VAL_CONVS=1
 NUM_TRAIN_CONVS=4   # train_batch_size * rollout.n must be divisible by N_GPUS (trainer validation requirement)

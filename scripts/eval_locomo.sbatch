@@ -37,6 +37,15 @@
 #   ROLLOUT_GPU_MEM_UTIL vLLM rollout gpu_memory_utilization (default 0.5, upstream)
 #   MM_PARAM_OFFLOAD=1   keep the FSDP actor/ref on CPU (frees ~25GB/GPU for KV cache if 0.5 OOMs)
 #   EXTRA_HYDRA_OVERRIDES  extra hydra overrides, applied after the memory defaults below
+#   2x H100 layout: sbatch --partition=gpu_h100 --gres=gpu:h100:2 with MM_PARAM_OFFLOAD=1 and, for gpt-oss
+#   on one 80GB GPU, VLLM_GPU_MEM_UTIL=0.92 VLLM_MAX_NUM_SEQS=128 (as train_memory_h200x2_h100x1.sbatch)
+#   CKPT_TRAIN_JOB       training job id; sets CKPT_EXP_DIR to $SCRATCH/checkpoints/curr_*_<id>_*
+#   CKPT_EXP_DIR         training run dir (checkpoints/<exp>); evaluates global_step_<best>/hf_fixed from its
+#                        best_checkpoint_info.txt (overrides MODEL_PATH_OVERRIDE)
+#   SEGMENTS_FILE        surprisal segments.json: test data gets segment_bounds_json (pair with
+#                        +actor_rollout_ref.rollout.use_segment_bounds=True and MAX_NUM_TURNS >= max segments)
+#   MAX_NUM_TURNS        rollout turns per session (client default 6)
+#   EVAL_DATA_SEED       data_preprocess.py seed for the regenerated eval data (test split is fixed by TEST_IDS)
 
 set -uo pipefail
 
@@ -51,16 +60,33 @@ mkdir -p "$SCRATCH/logs"
 # Split the 3 allocated GPUs: first -> answer agent, other two -> memory manager
 # ---------------------------------------------------------------------------
 IFS=',' read -ra GPUS <<< "${CUDA_VISIBLE_DEVICES:?CUDA_VISIBLE_DEVICES not set (run under sbatch with --gres=gpu:h200:3)}"
-if [ "${#GPUS[@]}" -ne 3 ]; then
-    echo "[eval] ERROR: expected 3 GPUs, got CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+# 3 GPUs (default) -> 1 answer agent + 2 memory manager; 2 GPUs (e.g. --gres=gpu:h100:2) -> 1 + 1.
+if [ "${#GPUS[@]}" -ne 3 ] && [ "${#GPUS[@]}" -ne 2 ]; then
+    echo "[eval] ERROR: expected 2 or 3 GPUs, got CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
     exit 1
 fi
 AA_GPU=${GPUS[0]}
-MM_GPUS="${GPUS[1]},${GPUS[2]}"
+MM_GPUS=$(IFS=','; echo "${GPUS[*]:1}")
+MM_N_GPUS=$(( ${#GPUS[@]} - 1 ))
 echo "[eval] node=$(hostname) job=$SLURM_JOB_ID answer-agent GPU=$AA_GPU memory-manager GPUs=$MM_GPUS"
 
 export ANSWER_AGENT_MODEL=${ANSWER_AGENT_MODEL:-ahmedehabb/Memory-R2-answer-agent}
 export MODEL_PATH_OVERRIDE=${MODEL_PATH_OVERRIDE:-ahmedehabb/Memory-R2}
+if [ -n "${CKPT_TRAIN_JOB:-}" ]; then
+    CKPT_EXP_DIR=$(ls -d "$SCRATCH"/checkpoints/curr_*_"${CKPT_TRAIN_JOB}"_* 2>/dev/null | head -1)
+    [ -n "$CKPT_EXP_DIR" ] || { echo "[eval] ERROR: no checkpoint dir for training job $CKPT_TRAIN_JOB"; exit 1; }
+fi
+if [ -n "${CKPT_EXP_DIR:-}" ]; then
+    if [ ! -f "$CKPT_EXP_DIR/best_checkpoint_info.txt" ]; then
+        echo "[eval] ERROR: no $CKPT_EXP_DIR/best_checkpoint_info.txt"
+        exit 1
+    fi
+    export MODEL_PATH_OVERRIDE=$CKPT_EXP_DIR/global_step_$(cat "$CKPT_EXP_DIR/best_checkpoint_info.txt")/hf_fixed
+    if [ ! -f "$MODEL_PATH_OVERRIDE/config.json" ]; then
+        echo "[eval] ERROR: $MODEL_PATH_OVERRIDE is not a converted HF checkpoint"
+        exit 1
+    fi
+fi
 export RUN_TAG=${RUN_TAG:-memr2_paper}
 export RUN_TS=$(date +%Y%m%d_%H%M%S)
 # judge_llm.py caches answers by prompt hash only, so keep one cache per answer-agent model;
@@ -100,6 +126,15 @@ mkdir -p "$VLLM_CACHE_ROOT" "$TORCHINDUCTOR_CACHE_DIR" "$XDG_CACHE_HOME"
 # Seed vLLM's torch.compile cache from the shared one (~170 files) to skip recompiling.
 cp -r "$HOME/.cache/vllm/." "$VLLM_CACHE_ROOT/" 2>/dev/null || true
 
+# Eval data, regenerated per job (scratch cleanup emptied the shared processed/ dir on 2026-11-16).
+export DATASET_DIR_OVERRIDE=$SCRATCH/data/locomo/processed_eval_$SLURM_JOB_ID
+mkdir -p "$DATASET_DIR_OVERRIDE"
+(cd "$REPO" && "$CONDA_ENV/bin/python" data/locomo/data_preprocess.py --max_sessions 32 \
+    --seed "${EVAL_DATA_SEED:-2843377488}" --output_dir "$DATASET_DIR_OVERRIDE" \
+    ${SEGMENTS_FILE:+--segments_file "$SEGMENTS_FILE"}) > "$SCRATCH/logs/eval_preprocess_$SLURM_JOB_ID.log" 2>&1 \
+    || { echo "[eval] ERROR: preprocessing failed, see $SCRATCH/logs/eval_preprocess_$SLURM_JOB_ID.log"; exit 1; }
+echo "[eval] eval data -> $DATASET_DIR_OVERRIDE ${SEGMENTS_FILE:+(segments: $SEGMENTS_FILE)}"
+
 # ---------------------------------------------------------------------------
 # 1) Answer agent on GPU 0
 #    gpt-oss needs the vLLM 0.11 apptainer image (the env's vLLM 0.8.5 can't serve it), so it goes
@@ -133,7 +168,7 @@ trap cleanup EXIT
 # ---------------------------------------------------------------------------
 export OPENAI_JUDGE_MODEL=$ANSWER_AGENT_MODEL
 export SERVER_WAIT_TIMEOUT=${SERVER_WAIT_TIMEOUT:-1800}
-export N_GPUS=2
+export N_GPUS=$MM_N_GPUS
 export REMA_DUMP_QA=1
 export VAL_KWARGS_N=${VAL_KWARGS_N:-1}
 export REMA_QA_DUMP_DIR=$SCRATCH/qa_dumps

@@ -347,22 +347,33 @@ class vLLMRollout(BaseRollout):
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 
-    def generate_fact_prompts(self, turns: List[List[Dict[str, str]]], current_turn=-1, max_turns=-1) -> List[str]:
+    def generate_fact_prompts(self, turns: List[List[Dict[str, str]]], current_turn=-1, max_turns=-1,
+                              segment_bounds=None) -> List[str]:
         """Generate fact extraction prompts for each conversation based on the provided turns.
         Args:
             turns: List of turns data (each turn is a list of dicts with 'speaker' and 'text')
             current_turn: Current turn index for multi-turn processing. Default is -1 (process all turns).
             max_turns: Maximum number of turns to process in multi-turn setting. Default is -1 (no limit).
+            segment_bounds: Optional per-sample [start, end) dialogue-turn bounds (surprisal segmentation,
+                parquet column segment_bounds_json); rollout turn `current_turn` then covers segment
+                `current_turn` instead of a ceil-div chunk.
         Returns:
             List of fact extraction prompts for each conversation.
         """
         prompts = []
-        for turns_data in turns:
+        for i_sample, turns_data in enumerate(turns):
             # Parse JSON string if needed
             if isinstance(turns_data, str):
                 turns_data = json.loads(turns_data)
-                
-            if current_turn >= 0 and max_turns > 0:
+
+            if current_turn >= 0 and segment_bounds is not None:
+                bounds = segment_bounds[i_sample]
+                if current_turn < len(bounds):
+                    start_idx, end_idx = bounds[current_turn]
+                    turns_data = turns_data[start_idx:end_idx]
+                else:
+                    turns_data = []  # sample already finished (the turn loop marks it done)
+            elif current_turn >= 0 and max_turns > 0:
                 # Divide turns across max_turns iterations if needed
                 total_turns = len(turns_data)
             
@@ -950,7 +961,28 @@ class vLLMRollout(BaseRollout):
         }
         # print(f"Initialized conversation_history for roles: {list(conversation_history.keys())}")
 
+        # Which limit ended each trajectory early: '' | fact_state | memory_state | fact_response | memory_response
+        trunc_role = ['' for _ in range(batch_size)]
+
+        segment_bounds = None
+        if self.config.get('use_segment_bounds', False):
+            if 'segment_bounds_json' not in prompts.non_tensor_batch:
+                raise RuntimeError("use_segment_bounds=True but the batch has no segment_bounds_json column "
+                                   "(preprocess with data_preprocess.py --segments_file)")
+            segment_bounds = [json.loads(b) if isinstance(b, str) else b
+                              for b in prompts.non_tensor_batch['segment_bounds_json']]
+            too_many = [len(b) for b in segment_bounds if len(b) > max_num_turns]
+            if too_many:
+                raise RuntimeError(f"{len(too_many)} samples have more segments ({max(too_many)}) than "
+                                   f"max_num_turns={max_num_turns}")
+
         for i_turn in range(max_num_turns):
+            if segment_bounds is not None:
+                # All segments of this session are processed: the trajectory ends normally.
+                for idx in np.where(~finish_flags)[0]:
+                    if i_turn >= len(segment_bounds[idx]):
+                        finish_flags[idx] = True
+                        finish_reason[idx] = "reach_max_turn"
             # Get indices of unfinished samples
             unfinished_indices = np.where(~finish_flags)[0]
             # print(f"\n{'='*60}")
@@ -1010,7 +1042,8 @@ class vLLMRollout(BaseRollout):
                 fact_prompts = self.generate_fact_prompts(
                     prompts.non_tensor_batch["turns_json"],
                     current_turn=i_turn,
-                    max_turns=max_num_turns
+                    max_turns=max_num_turns,
+                    segment_bounds=segment_bounds,
                 )
                 fact_prompts = np.array(fact_prompts, dtype=object)
 
@@ -1088,6 +1121,7 @@ class vLLMRollout(BaseRollout):
                             # set finish flag and finish reason 
                             finish_flags[idx] = True
                             finish_reason[idx] = "completion_token_exceeded"
+                            trunc_role[idx] = "fact_state" if role == agent_roles[0] else "memory_state"
                             # print(f'idx={idx}, completion_token_exceeded')
                             # if the next gen is for reasoning agent, we need to add a dummy response in history
                             if role == agent_roles[1]:
@@ -1219,6 +1253,12 @@ class vLLMRollout(BaseRollout):
                     idx = unfinished_indices[i]
                     conversation_history[role][idx] = chat_lst[i]
 
+                if self.config.stop_when_truncated:
+                    for i, sr in enumerate(stop_reasons):
+                        if sr == "length":
+                            trunc_role[unfinished_indices[i]] = (
+                                "fact_response" if role == agent_roles[0] else "memory_response")
+
                 # XXX(ziyu): side effect on `history`
                 # print(f"  Updating history and checking finish conditions...")
                 self._update_history_and_check_finish(
@@ -1248,6 +1288,7 @@ class vLLMRollout(BaseRollout):
         # use the last output of each agent as latest output response
         latest_outputs = [h[-1]['content'] for h in history]
 
+        self._trunc_role = trunc_role
         return latest_outputs, conversation_history, conv_memories, shared_manager, mem_op_stats
     
     def _execute_memory_operations(
@@ -1770,6 +1811,8 @@ class vLLMRollout(BaseRollout):
             len(h) // len(agent_roles) for h in history
         ]
         non_tensor_batch["response"] = latest_outputs
+        # Which limit (if any) ended each trajectory early (see _run_multi_turn_conversation).
+        non_tensor_batch["trunc_role"] = np.array(getattr(self, '_trunc_role', [''] * len(history)), dtype=object)
         
         # Add memory operation statistics if available
         if mem_op_stats is not None:

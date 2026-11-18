@@ -10,6 +10,7 @@ import pandas as pd
 CHUNK_BY_SESSION = True  # If True, each session becomes one chunk (ignores CHUNK_SIZE)
 MAX_SESSION = None # set to None to use all sessions
 CHUNK_SIZE = 8  # Number of dialogue turns per chunk (only used if CHUNK_BY_SESSION=False)
+SEGMENTS = None  # {"sample_id|session_id": [[start, end), ...]} from compute_surprisal.py (--segments_file)
 INPUT_JSON = str(Path(__file__).resolve().parent / "locomo10.json")
 OUTPUT_DIR = Path(__file__).resolve().parent / "processed"
 
@@ -938,6 +939,12 @@ def process_locomo10(data_path=INPUT_JSON, output_dir=OUTPUT_DIR):
                 'future_qas': chunk['qa_stats']['future'],
                 'speakers': chunk['speakers'],
             }
+            if SEGMENTS is not None:
+                bounds = SEGMENTS[f"{chunk['sample_id']}|{chunk['session_id']}"]
+                assert bounds[-1][1] == len(chunk['turns']), (
+                    f"segments for {chunk['sample_id']} session {chunk['session_id']} cover "
+                    f"{bounds[-1][1]} turns, chunk has {len(chunk['turns'])}")
+                row['segment_bounds_json'] = json.dumps(bounds)  # [start, end) dialogue-turn bounds per rollout turn
             rows.append(row)
         
         df = pd.DataFrame(rows)
@@ -1027,6 +1034,7 @@ if __name__ == "__main__":
     parser.add_argument("--test_convs", type=int, default=None, help="Number of test conversations (overrides global TEST_CONVS)")
     parser.add_argument("--val_convs", type=int, default=None, help="Number of validation conversations (overrides global VAL_CONVS)")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
+    parser.add_argument("--segments_file", type=str, default=None, help="segments.json from compute_surprisal.py; adds column segment_bounds_json")
     parser.add_argument("--output_dir", type=str, default=None, help="Output directory for parquet files (default: data/locomo/processed)")
     args = parser.parse_args()
     
@@ -1051,6 +1059,10 @@ if __name__ == "__main__":
     if args.val_convs is not None:
         VAL_CONVS = args.val_convs
         print(f"🔧 Overriding VAL_CONVS with: {VAL_CONVS}")
+
+    if args.segments_file:
+        SEGMENTS = json.loads(Path(args.segments_file).read_text())["segments"]
+        print(f"🔧 Surprisal segments from: {args.segments_file}")
 
     output_dir = Path(args.output_dir) if args.output_dir else OUTPUT_DIR
     if args.output_dir:
